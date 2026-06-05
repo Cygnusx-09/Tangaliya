@@ -1,5 +1,5 @@
 import { useState, useRef, useCallback, useEffect } from "react";
-import { Eraser, Pen, Trash2, Minus, Plus, ZoomIn, ZoomOut, Maximize2, Undo2, MousePointer2, FileImage, FileCode2, Printer, Frame, Palette, Grid3x3, Magnet, SlidersHorizontal, Ruler } from "lucide-react";
+import { Eraser, Pen, Trash2, ZoomIn, ZoomOut, Maximize2, Undo2, Redo2, MousePointer2, FileImage, FileCode2, Printer, Grid3x3, Magnet, Ruler } from "lucide-react";
 
 type SnapMode = "both" | "corner" | "center";
 type Tool = "draw" | "erase" | "select";
@@ -198,7 +198,9 @@ const UnitInput: React.FC<{
 export function DotArtTool() {
   const [dots, setDots] = useState<Map<string, Dot>>(new Map());
   const [undoCount, setUndoCount] = useState(0);
+  const [redoCount, setRedoCount] = useState(0);
   const [color, setColor] = useState("#FF2A2A");
+  const [recentColors, setRecentColors] = useState<string[]>([]);
   const [radius, setRadius] = useState(3);
   const [tool, setTool] = useState<Tool>("draw");
   const [snapMode, setSnapMode] = useState<SnapMode>("both");
@@ -221,6 +223,7 @@ export function DotArtTool() {
   const [zoom, setZoom] = useState(1);
   const [pan, setPan] = useState({ x: 0, y: 0 });
   const [isGrabbing, setIsGrabbing] = useState(false);
+  const [confirmingClear, setConfirmingClear] = useState(false);
 
   const [selectedKeys, setSelectedKeys] = useState<Set<string>>(new Set());
   const [marqueeBox, setMarqueeBox] = useState<{ wx1: number; wy1: number; wx2: number; wy2: number } | null>(null);
@@ -231,6 +234,10 @@ export function DotArtTool() {
   const panRef = useRef({ x: 0, y: 0 });
   const dotsRef = useRef<Map<string, Dot>>(new Map());
   const undoStackRef = useRef<Map<string, Dot>[]>([]);
+  const redoStackRef = useRef<Map<string, Dot>[]>([]);
+  const clipboardRef = useRef<Dot[]>([]);
+  const pasteCountRef = useRef(0);
+  const marqueeBaseRef = useRef<Set<string>>(new Set());
   const selectedKeysRef = useRef<Set<string>>(new Set());
   const isPaintingRef = useRef(false);
   const isPanningRef = useRef(false);
@@ -312,12 +319,37 @@ export function DotArtTool() {
     }
   }, [viewportSize, fitToViewport]);
 
+  // Snapshot current dots onto the undo stack. Any new action invalidates redo.
   const pushUndo = useCallback(() => {
     const snapshot = new Map(dotsRef.current);
     const newStack = [...undoStackRef.current.slice(-(MAX_UNDO - 1)), snapshot];
     undoStackRef.current = newStack;
     setUndoCount(newStack.length);
+    redoStackRef.current = [];
+    setRedoCount(0);
   }, []);
+
+  const pushRecentColor = useCallback((c: string) => {
+    setRecentColors((prev) => [c, ...prev.filter((p) => p.toLowerCase() !== c.toLowerCase())].slice(0, 8));
+  }, []);
+
+  // Set the brush color (draw mode) or recolor the current selection, tracking recents.
+  const chooseColor = useCallback((c: string) => {
+    if (toolRef.current === "select" && selectedKeysRef.current.size > 0) {
+      pushUndo();
+      setDots((prev) => {
+        const next = new Map(prev);
+        for (const key of selectedKeysRef.current) {
+          const dot = next.get(key);
+          if (dot) next.set(key, { ...dot, color: c });
+        }
+        return next;
+      });
+    } else {
+      setColor(c);
+    }
+    pushRecentColor(c);
+  }, [pushUndo, pushRecentColor]);
 
   const updateSelectedDots = useCallback((patch: Partial<Pick<Dot, "color" | "radius">>) => {
     if (selectedKeysRef.current.size === 0) return;
@@ -336,10 +368,117 @@ export function DotArtTool() {
     if (undoStackRef.current.length === 0) return;
     const newStack = undoStackRef.current.slice(0, -1);
     const restored = new Map(undoStackRef.current[undoStackRef.current.length - 1]);
+    redoStackRef.current = [...redoStackRef.current, new Map(dotsRef.current)];
+    setRedoCount(redoStackRef.current.length);
     undoStackRef.current = newStack;
     dotsRef.current = restored;
     setDots(restored);
     setUndoCount(newStack.length);
+  }, []);
+
+  const redo = useCallback(() => {
+    if (redoStackRef.current.length === 0) return;
+    const next = new Map(redoStackRef.current[redoStackRef.current.length - 1]);
+    undoStackRef.current = [...undoStackRef.current, new Map(dotsRef.current)];
+    setUndoCount(undoStackRef.current.length);
+    redoStackRef.current = redoStackRef.current.slice(0, -1);
+    setRedoCount(redoStackRef.current.length);
+    dotsRef.current = next;
+    setDots(next);
+  }, []);
+
+  // ── Selection operations (keyboard-driven) ──
+  const deleteSelected = useCallback(() => {
+    if (selectedKeysRef.current.size === 0) return;
+    pushUndo();
+    setDots((prev) => {
+      const next = new Map(prev);
+      for (const key of selectedKeysRef.current) next.delete(key);
+      return next;
+    });
+    setSelectedKeys(new Set());
+    selectedKeysRef.current = new Set();
+  }, [pushUndo]);
+
+  const selectAll = useCallback(() => {
+    setTool("select");
+    const all = new Set(dotsRef.current.keys());
+    setSelectedKeys(all);
+    selectedKeysRef.current = all;
+  }, []);
+
+  // Place a batch of dots offset by (dx,dy), assign fresh grid keys, and select them.
+  const placeDots = useCallback((source: Dot[], dx: number, dy: number) => {
+    if (source.length === 0) return;
+    pushUndo();
+    const next = new Map(dotsRef.current);
+    const newSelected = new Set<string>();
+    for (const dot of source) {
+      const pos = keyFromPosition(dot.x + dx, dot.y + dy);
+      next.set(pos.key, { ...dot, key: pos.key, x: pos.x, y: pos.y });
+      newSelected.add(pos.key);
+    }
+    dotsRef.current = next;
+    setDots(next);
+    setTool("select");
+    setSelectedKeys(newSelected);
+    selectedKeysRef.current = newSelected;
+  }, [pushUndo]);
+
+  const copySelected = useCallback(() => {
+    const picked = Array.from(selectedKeysRef.current)
+      .map((k) => dotsRef.current.get(k))
+      .filter(Boolean) as Dot[];
+    if (picked.length === 0) return;
+    clipboardRef.current = picked.map((d) => ({ ...d }));
+    pasteCountRef.current = 0;
+  }, []);
+
+  const pasteClipboard = useCallback(() => {
+    if (clipboardRef.current.length === 0) return;
+    pasteCountRef.current += 1;
+    const off = CELL_SIZE * pasteCountRef.current;
+    placeDots(clipboardRef.current, off, off);
+  }, [placeDots]);
+
+  const duplicateSelected = useCallback(() => {
+    const picked = Array.from(selectedKeysRef.current)
+      .map((k) => dotsRef.current.get(k))
+      .filter(Boolean) as Dot[];
+    placeDots(picked, CELL_SIZE, CELL_SIZE);
+  }, [placeDots]);
+
+  const nudgeSelected = useCallback((dx: number, dy: number) => {
+    if (selectedKeysRef.current.size === 0) return;
+    pushUndo();
+    const base = new Map(dotsRef.current);
+    const newSelected = new Set<string>();
+    for (const key of selectedKeysRef.current) {
+      const dot = base.get(key);
+      if (!dot) continue;
+      base.delete(key);
+    }
+    for (const key of selectedKeysRef.current) {
+      const dot = dotsRef.current.get(key);
+      if (!dot) continue;
+      const pos = keyFromPosition(dot.x + dx, dot.y + dy);
+      base.set(pos.key, { ...dot, key: pos.key, x: pos.x, y: pos.y });
+      newSelected.add(pos.key);
+    }
+    dotsRef.current = base;
+    setDots(base);
+    setSelectedKeys(newSelected);
+    selectedKeysRef.current = newSelected;
+  }, [pushUndo]);
+
+  // Double-click a dot → select every dot sharing its color.
+  const selectSameColor = useCallback((targetColor: string) => {
+    setTool("select");
+    const matches = new Set<string>();
+    for (const dot of dotsRef.current.values())
+      if (dot.color === targetColor) matches.add(dot.key);
+    setSelectedKeys(matches);
+    selectedKeysRef.current = matches;
   }, []);
 
   useEffect(() => {
@@ -358,15 +497,39 @@ export function DotArtTool() {
     const handler = (e: KeyboardEvent) => {
       const target = e.target as HTMLElement;
       if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA")) return;
-      if ((e.ctrlKey || e.metaKey) && e.key === "z" && !e.shiftKey) { e.preventDefault(); undo(); }
+      const mod = e.ctrlKey || e.metaKey;
+
+      if (mod && (e.key === "z" || e.key === "Z")) { e.preventDefault(); e.shiftKey ? redo() : undo(); return; }
+      if (mod && (e.key === "y" || e.key === "Y")) { e.preventDefault(); redo(); return; }
+      if (mod && (e.key === "a" || e.key === "A")) { e.preventDefault(); selectAll(); return; }
+      if (mod && (e.key === "c" || e.key === "C")) { e.preventDefault(); copySelected(); return; }
+      if (mod && (e.key === "v" || e.key === "V")) { e.preventDefault(); pasteClipboard(); return; }
+      if (mod && (e.key === "d" || e.key === "D")) { e.preventDefault(); duplicateSelected(); return; }
+
+      if (e.key === "Delete" || e.key === "Backspace") {
+        if (selectedKeysRef.current.size > 0) { e.preventDefault(); deleteSelected(); }
+        return;
+      }
+      if (e.key.startsWith("Arrow") && selectedKeysRef.current.size > 0) {
+        e.preventDefault();
+        const step = e.shiftKey ? CELL_SIZE : HALF_CELL;
+        if (e.key === "ArrowLeft") nudgeSelected(-step, 0);
+        else if (e.key === "ArrowRight") nudgeSelected(step, 0);
+        else if (e.key === "ArrowUp") nudgeSelected(0, -step);
+        else if (e.key === "ArrowDown") nudgeSelected(0, step);
+        return;
+      }
+
       if (e.key === "Escape") { setSelectedKeys(new Set()); selectedKeysRef.current = new Set(); }
       if (e.key === "v" || e.key === "V") { setTool("select"); }
       if (e.key === "b" || e.key === "B") { setTool("draw"); }
       if (e.key === "e" || e.key === "E") { setTool("erase"); }
     };
-    window.addEventListener("keydown", handler);
-    return () => window.removeEventListener("keydown", handler);
-  }, [undo]);
+    // Capture phase so our shortcuts run before any host/bubble handler that
+    // might swallow Ctrl+Z (e.g. an embedding preview's own undo).
+    window.addEventListener("keydown", handler, true);
+    return () => window.removeEventListener("keydown", handler, true);
+  }, [undo, redo, selectAll, copySelected, pasteClipboard, duplicateSelected, deleteSelected, nudgeSelected]);
 
   useEffect(() => {
     const svg = svgRef.current;
@@ -421,8 +584,32 @@ export function DotArtTool() {
     const world = getSVGPoint(e);
     if (!world) return;
 
+    // Alt+click = eyedropper: pick a dot's color into the brush (works in any tool)
+    if (e.altKey) {
+      const hit = findDotAt(dotsRef.current, world.x, world.y);
+      if (hit) { setColor(hit.color); pushRecentColor(hit.color); }
+      return;
+    }
+
     if (toolRef.current === "select") {
       const hit = findDotAt(dotsRef.current, world.x, world.y);
+
+      // Shift = additive: toggle a dot in/out, or union-marquee from current selection
+      if (e.shiftKey) {
+        if (hit) {
+          const next = new Set(selectedKeysRef.current);
+          next.has(hit.key) ? next.delete(hit.key) : next.add(hit.key);
+          setSelectedKeys(next);
+          selectedKeysRef.current = next;
+        } else {
+          marqueeBaseRef.current = new Set(selectedKeysRef.current);
+          isMarqueeingRef.current = true;
+          marqueeStartRef.current = { wx: world.x, wy: world.y };
+          setMarqueeBox(null);
+        }
+        return;
+      }
+
       if (hit) {
         if (!selectedKeysRef.current.has(hit.key)) {
           const next = new Set([hit.key]);
@@ -437,6 +624,7 @@ export function DotArtTool() {
       } else {
         setSelectedKeys(new Set());
         selectedKeysRef.current = new Set();
+        marqueeBaseRef.current = new Set();
         isMarqueeingRef.current = true;
         marqueeStartRef.current = { wx: world.x, wy: world.y };
         setMarqueeBox(null);
@@ -448,7 +636,15 @@ export function DotArtTool() {
     isPaintingRef.current = true;
     const snap = getNearestSnap(world.x, world.y, CELL_SIZE, snapModeRef.current, canvasBoundsRef.current.w, canvasBoundsRef.current.h);
     if (snap) { setPreview({ x: snap.x, y: snap.y }); applyDrawTool(snap.key, snap.x, snap.y); }
-  }, [getSVGPoint, applyDrawTool, pushUndo]);
+  }, [getSVGPoint, applyDrawTool, pushUndo, pushRecentColor]);
+
+  const handleDoubleClick = useCallback((e: React.MouseEvent) => {
+    if (e.button !== 0) return;
+    const world = getSVGPoint(e);
+    if (!world) return;
+    const hit = findDotAt(dotsRef.current, world.x, world.y);
+    if (hit) selectSameColor(hit.color);
+  }, [getSVGPoint, selectSameColor]);
 
   const handleMouseMove = useCallback((e: React.MouseEvent) => {
     if (isPanningRef.current && panStartRef.current) {
@@ -471,8 +667,10 @@ export function DotArtTool() {
       } else if (isMarqueeingRef.current && marqueeStartRef.current) {
         setMarqueeBox({ wx1: marqueeStartRef.current.wx, wy1: marqueeStartRef.current.wy, wx2: world.x, wy2: world.y });
         const keys = dotsInRect(dotsRef.current, marqueeStartRef.current.wx, marqueeStartRef.current.wy, world.x, world.y);
-        setSelectedKeys(keys);
-        selectedKeysRef.current = keys;
+        const union = new Set(marqueeBaseRef.current);
+        for (const k of keys) union.add(k);
+        setSelectedKeys(union);
+        selectedKeysRef.current = union;
       } else {
         const hit = findDotAt(dotsRef.current, world.x, world.y);
         setHoveredDotKey(hit ? hit.key : null);
@@ -663,14 +861,142 @@ export function DotArtTool() {
   const selMixed = selColors.length > 1 || selRadii.length > 1;
 
   return (
-    <div className="flex h-screen w-screen overflow-hidden bg-neutral-100">
+    <div className="flex h-screen w-screen overflow-hidden bg-[#e8e8e8]">
+
+      {/* ── Left panel ── */}
+      <aside className="w-[216px] bg-white border-r border-neutral-200 flex flex-col h-screen overflow-hidden shrink-0">
+
+        <div className="px-5 py-4 border-b border-neutral-200 shrink-0">
+          <span className="text-[11px] font-bold tracking-[0.22em] uppercase text-neutral-400">Dot Art</span>
+        </div>
+
+        <div className="px-4 py-4 border-b border-neutral-200 shrink-0">
+          <div className="text-[9px] font-semibold tracking-[0.2em] uppercase text-neutral-400 mb-3">Tools</div>
+          <div className="flex flex-col gap-0.5 mb-3">
+            {([
+              { t: "draw" as Tool, icon: <Pen size={13} />, label: "Draw", shortcut: "B" },
+              { t: "erase" as Tool, icon: <Eraser size={13} />, label: "Erase", shortcut: "E" },
+              { t: "select" as Tool, icon: <MousePointer2 size={13} />, label: "Select", shortcut: "V" },
+            ]).map(({ t, icon, label, shortcut }) => (
+              <button key={t}
+                onClick={() => { setTool(t); if (t !== "select") { setSelectedKeys(new Set()); selectedKeysRef.current = new Set(); } }}
+                title={`${label} (${shortcut})`}
+                className={`flex items-center gap-2.5 px-3 py-2.5 text-[12px] font-medium transition-all ${
+                  tool === t ? "bg-black text-white" : "text-neutral-600 hover:bg-neutral-100"
+                }`}>
+                {icon}<span>{label}</span>
+                <span className={`ml-auto text-[10px] font-mono ${tool === t ? "text-white/40" : "text-neutral-300"}`}>{shortcut}</span>
+              </button>
+            ))}
+          </div>
+          <div className="flex gap-1">
+            <button onClick={undo} disabled={undoCount === 0} title="Undo (Ctrl+Z)"
+              className="flex-1 flex items-center justify-center gap-1.5 px-2 py-2 text-[11px] text-neutral-500 hover:bg-neutral-100 hover:text-neutral-700 disabled:opacity-25 disabled:cursor-not-allowed transition-all">
+              <Undo2 size={12} /><span>Undo</span>
+            </button>
+            <button onClick={redo} disabled={redoCount === 0} title="Redo (Ctrl+Shift+Z)"
+              className="flex-1 flex items-center justify-center gap-1.5 px-2 py-2 text-[11px] text-neutral-500 hover:bg-neutral-100 hover:text-neutral-700 disabled:opacity-25 disabled:cursor-not-allowed transition-all">
+              <Redo2 size={12} /><span>Redo</span>
+            </button>
+          </div>
+        </div>
+
+        <div className="flex-1 overflow-y-auto" style={{ scrollbarWidth: "none" }}>
+          {(tool === "draw" || (tool === "select" && selectedKeys.size > 0)) && (
+            <div className="px-4 py-4">
+              <div className="text-[9px] font-semibold tracking-[0.2em] uppercase text-neutral-400 mb-3">
+                {tool === "select" ? "Edit" : "Brush"}
+              </div>
+              <div className="grid grid-cols-6 gap-2 mb-3">
+                {PALETTE.map((c) => {
+                  const isActive = tool === "select" ? (selColor === c && !selMixed) : color === c;
+                  return (
+                    <button key={c}
+                      onClick={() => chooseColor(c)}
+                      className="aspect-square transition-all hover:scale-110 active:scale-95"
+                      style={{ backgroundColor: c, outline: isActive ? "2.5px solid #111" : "2px solid transparent", outlineOffset: "2px", border: c === "#FFFFFF" ? "1px solid #ddd" : "none" }} />
+                  );
+                })}
+              </div>
+              {recentColors.length > 0 && (
+                <div className="mb-3">
+                  <div className="text-[9px] font-semibold tracking-[0.2em] uppercase text-neutral-400 mb-1.5">Recent</div>
+                  <div className="flex gap-1.5">
+                    {recentColors.map((c) => (
+                      <button key={c} onClick={() => chooseColor(c)} title={c.toUpperCase()}
+                        className="w-5 h-5 transition-all hover:scale-110 active:scale-95"
+                        style={{ backgroundColor: c, border: c.toLowerCase() === "#ffffff" ? "1px solid #ddd" : "none" }} />
+                    ))}
+                  </div>
+                </div>
+              )}
+              <div className="flex items-center gap-2.5 mb-4">
+                <input type="color"
+                  value={tool === "select" ? selColor : color}
+                  onChange={(e) => tool === "select" ? updateSelectedDots({ color: e.target.value }) : setColor(e.target.value)}
+                  onBlur={(e) => pushRecentColor(e.target.value)}
+                  className="w-8 h-8 cursor-pointer border border-neutral-200 p-0.5 shrink-0" />
+                <span className="text-[11px] text-neutral-400 font-mono uppercase">
+                  {tool === "select" && selMixed ? "mixed" : (tool === "select" ? selColor : color)}
+                </span>
+              </div>
+              <div>
+                <div className="flex items-center justify-between mb-2">
+                  <span className="text-[9px] font-semibold tracking-[0.2em] uppercase text-neutral-400">Size</span>
+                  <span className="text-[11px] text-neutral-600 font-mono">
+                    {tool === "select" ? (selMixed ? "mixed" : `${selRadius}px`) : `${radius}px`}
+                  </span>
+                </div>
+                <input type="range" min={1} max={14}
+                  value={tool === "select" ? (selMixed ? 7 : selRadius) : radius}
+                  onChange={(e) => {
+                    const v = Number(e.target.value);
+                    tool === "select" ? updateSelectedDots({ radius: v }) : setRadius(v);
+                  }}
+                  className="w-full accent-neutral-800" />
+              </div>
+            </div>
+          )}
+
+          {tool === "erase" && (
+            <div className="px-4 py-4">
+              <div className="text-[9px] font-semibold tracking-[0.2em] uppercase text-neutral-400 mb-3">Eraser</div>
+              <div>
+                <div className="flex items-center justify-between mb-2">
+                  <span className="text-[9px] font-semibold tracking-[0.2em] uppercase text-neutral-400">Radius</span>
+                  <span className="text-[11px] text-neutral-600 font-mono">{radius}px</span>
+                </div>
+                <input type="range" min={1} max={14} value={radius}
+                  onChange={(e) => setRadius(Number(e.target.value))}
+                  className="w-full accent-neutral-800" />
+              </div>
+            </div>
+          )}
+
+          {tool === "select" && selectedKeys.size === 0 && (
+            <div className="px-4 py-4">
+              <div className="text-[9px] font-semibold tracking-[0.2em] uppercase text-neutral-400 mb-3">Select</div>
+              <p className="text-[11px] text-neutral-400 leading-relaxed">
+                Click a dot · Shift+click to add · Drag to marquee · Double-click to select same color · Ctrl+A all · Esc to deselect
+              </p>
+            </div>
+          )}
+        </div>
+
+        <div className="px-5 py-3 border-t border-neutral-200 shrink-0 flex items-center justify-between">
+          <span className="text-[10px] text-neutral-400">{dots.size} dot{dots.size !== 1 ? "s" : ""}</span>
+          <span className="text-[10px] text-neutral-400 font-mono">{Math.round(zoom * 100)}%</span>
+        </div>
+
+      </aside>
 
       {/* ── Canvas ── */}
       <div ref={containerRef} className="flex-1 relative overflow-hidden">
         <svg ref={svgRef} width={viewportSize.width} height={viewportSize.height}
           className="absolute inset-0 select-none" style={{ cursor }}
           onMouseMove={handleMouseMove} onMouseDown={handleMouseDown}
-          onMouseUp={handleMouseUp} onMouseLeave={handleMouseLeave}>
+          onMouseUp={handleMouseUp} onMouseLeave={handleMouseLeave}
+          onDoubleClick={handleDoubleClick}>
 
           <rect width={viewportSize.width} height={viewportSize.height} fill="#e8e8ea" />
 
@@ -769,138 +1095,49 @@ export function DotArtTool() {
         </div>
 
         <div className="absolute top-4 left-4 text-[11px] text-neutral-400 pointer-events-none">
-          Scroll to zoom · Space+drag to pan · B Draw · E Erase · V Select · Ctrl+Z Undo
+          Scroll zoom · Space+drag pan · B/E/V tools · Alt+click eyedropper · Ctrl+C/V copy · Ctrl+D dup · ⌫ delete · Arrows nudge
         </div>
       </div>
 
-      {/* ── Right toolbar ── */}
-      <aside className="w-[260px] bg-white border-l border-neutral-200 flex flex-col h-screen overflow-hidden shrink-0 text-[12px]">
+      {/* ── Right panel ── */}
+      <aside className="w-[232px] bg-white border-l border-neutral-200 flex flex-col h-screen overflow-hidden shrink-0">
 
-        {/* Tools + Undo */}
-        <div className="px-3 pt-3 pb-2 shrink-0 border-b border-neutral-100">
-          <div className="flex gap-1 mb-2">
-            {([
-              { t: "draw" as Tool, icon: <Pen size={14} />, label: "Draw", shortcut: "B" },
-              { t: "erase" as Tool, icon: <Eraser size={14} />, label: "Erase", shortcut: "E" },
-              { t: "select" as Tool, icon: <MousePointer2 size={14} />, label: "Select", shortcut: "V" },
-            ]).map(({ t, icon, label, shortcut }) => (
-              <button key={t} onClick={() => { setTool(t); if (t !== "select") { setSelectedKeys(new Set()); selectedKeysRef.current = new Set(); } }}
-                title={`${label} (${shortcut})`}
-                className={`flex-1 flex items-center justify-center gap-1.5 py-2 rounded-md text-[11px] transition-colors ${
-                  tool === t
-                    ? "bg-neutral-900 text-white"
-                    : "text-neutral-600 hover:bg-neutral-100"
-                }`}>
-                {icon}
-                <span>{label}</span>
-              </button>
-            ))}
+        <div className="px-5 py-4 border-b border-neutral-200 shrink-0">
+          <div className="text-[9px] font-semibold tracking-[0.2em] uppercase text-neutral-400 mb-3">Canvas</div>
+          <div className="flex items-center gap-2 mb-2.5">
+            <UnitInput value={wInput} onChange={setWInput} onCommit={commitW} unit={unit} />
+            <span className="text-neutral-300 text-xs shrink-0">×</span>
+            <UnitInput value={hInput} onChange={setHInput} onCommit={commitH} unit={unit} />
           </div>
-          <button onClick={undo} disabled={undoCount === 0}
-            className="w-full flex items-center justify-center gap-1.5 py-1.5 rounded-md text-[11px] text-neutral-500 hover:bg-neutral-100 disabled:opacity-30 disabled:cursor-not-allowed transition-colors">
-            <Undo2 size={12} /> Undo {undoCount > 0 && <span className="text-neutral-400 font-mono text-[10px]">({undoCount})</span>}
-          </button>
-        </div>
-
-        {/* Scrollable settings */}
-        <div className="flex-1 overflow-y-auto px-3 py-2 flex flex-col gap-3">
-
-          {/* Color + Size — always visible for draw/erase, or when editing selection */}
-          {(tool === "draw" || (tool === "select" && selectedKeys.size > 0)) && (
-            <div>
-              <div className="text-[10px] text-neutral-400 uppercase mb-1.5">Color</div>
-              <div className="grid grid-cols-6 gap-1.5 mb-2">
-                {PALETTE.map((c) => {
-                  const isActive = tool === "select" ? (selColor === c && !selMixed) : color === c;
-                  return (
-                    <button key={c}
-                      onClick={() => tool === "select" ? updateSelectedDots({ color: c }) : setColor(c)}
-                      className="aspect-square rounded-full hover:scale-110 active:scale-95 transition-transform"
-                      style={{ backgroundColor: c, outline: isActive ? "2px solid #333" : "none", outlineOffset: "2px", border: c === "#FFFFFF" ? "1px solid #ddd" : "none" }} />
-                  );
-                })}
-              </div>
-              <div className="flex items-center gap-2">
-                <input type="color"
-                  value={tool === "select" ? selColor : color}
-                  onChange={(e) => tool === "select" ? updateSelectedDots({ color: e.target.value }) : setColor(e.target.value)}
-                  className="w-7 h-7 rounded cursor-pointer border border-neutral-200 p-0.5" />
-                <span className="text-[11px] text-neutral-400 font-mono">
-                  {tool === "select" && selMixed ? "mixed" : (tool === "select" ? selColor : color).toUpperCase()}
-                </span>
-              </div>
-            </div>
-          )}
-
-          {(tool === "draw" || tool === "erase" || (tool === "select" && selectedKeys.size > 0)) && (
-            <div>
-              <div className="flex items-center justify-between mb-1">
-                <span className="text-[10px] text-neutral-400 uppercase">
-                  {tool === "erase" ? "Radius" : "Dot size"}
-                </span>
-                <span className="text-[11px] text-neutral-500 font-mono">
-                  {tool === "select" ? (selMixed ? "mixed" : `${selRadius}px`) : `${radius}px`}
-                </span>
-              </div>
-              <input type="range" min={1} max={14}
-                value={tool === "select" ? (selMixed ? 7 : selRadius) : radius}
-                onChange={(e) => {
-                  const v = Number(e.target.value);
-                  tool === "select" ? updateSelectedDots({ radius: v }) : setRadius(v);
-                }}
-                className="w-full accent-neutral-800" />
-            </div>
-          )}
-
-          {/* Select mode hint */}
-          {tool === "select" && selectedKeys.size === 0 && (
-            <p className="text-[11px] text-neutral-400 leading-relaxed">
-              Click a dot to select · Drag to marquee · Drag selection to move · Esc to deselect
-            </p>
-          )}
-
-          {/* Divider */}
-          <hr className="border-neutral-100" />
-
-          {/* Canvas */}
-          <div>
-            <div className="text-[10px] text-neutral-400 uppercase mb-1.5">Canvas size</div>
-            <div className="flex items-center gap-1.5 mb-2">
-              <UnitInput value={wInput} onChange={setWInput} onCommit={commitW} unit={unit} />
-              <span className="text-neutral-300">×</span>
-              <UnitInput value={hInput} onChange={setHInput} onCommit={commitH} unit={unit} />
-            </div>
-            <div className="flex gap-1 mb-2">
-              {[
-                { mm_w: 100, mm_h: 100, label: "100²" },
-                { mm_w: 200, mm_h: 150, label: "4:3" },
-                { mm_w: 297, mm_h: 210, label: "A4" },
-              ].map((p) => {
-                const w = roundForUnit(convertUnit(p.mm_w, "mm", unit), unit);
-                const h = roundForUnit(convertUnit(p.mm_h, "mm", unit), unit);
-                return (
-                  <button key={p.label} onClick={() => { setCanvasPhysW(w); setCanvasPhysH(h); setWInput(String(w)); setHInput(String(h)); }}
-                    className="flex-1 py-1 rounded text-[10px] text-neutral-500 hover:bg-neutral-100 transition-colors">
-                    {p.label}
-                  </button>
-                );
-              })}
-            </div>
+          <div className="flex gap-1 mb-3">
+            {[
+              { mm_w: 100, mm_h: 100, label: "100²" },
+              { mm_w: 200, mm_h: 150, label: "4:3" },
+              { mm_w: 297, mm_h: 210, label: "A4" },
+            ].map((p) => {
+              const w = roundForUnit(convertUnit(p.mm_w, "mm", unit), unit);
+              const h = roundForUnit(convertUnit(p.mm_h, "mm", unit), unit);
+              return (
+                <button key={p.label}
+                  onClick={() => { setCanvasPhysW(w); setCanvasPhysH(h); setWInput(String(w)); setHInput(String(h)); }}
+                  className="flex-1 py-1.5 text-[10px] font-medium text-neutral-500 hover:bg-neutral-100 hover:text-neutral-700 transition-all">
+                  {p.label}
+                </button>
+              );
+            })}
           </div>
-
-          {/* Cell + Units */}
           <div className="flex gap-3">
             <div className="flex-1">
-              <div className="text-[10px] text-neutral-400 uppercase mb-1.5">Cell size</div>
+              <div className="text-[9px] font-semibold tracking-[0.2em] uppercase text-neutral-400 mb-1.5">Cell</div>
               <UnitInput value={cellInput} onChange={setCellInput} onCommit={commitCell} unit={unit} />
             </div>
             <div className="flex-1">
-              <div className="text-[10px] text-neutral-400 uppercase mb-1.5">Units</div>
-              <div className="flex bg-neutral-100 rounded p-0.5">
+              <div className="text-[9px] font-semibold tracking-[0.2em] uppercase text-neutral-400 mb-1.5">Units</div>
+              <div className="flex bg-neutral-100 p-0.5">
                 {(["mm", "cm", "in"] as Unit[]).map((u) => (
                   <button key={u} onClick={() => changeUnit(u)}
-                    className={`flex-1 py-1 rounded text-[11px] font-mono transition-colors ${
-                      unit === u ? "bg-white text-neutral-900 shadow-sm" : "text-neutral-500"
+                    className={`flex-1 py-1 text-[11px] font-mono transition-all ${
+                      unit === u ? "bg-white text-neutral-900 shadow-sm" : "text-neutral-500 hover:text-neutral-700"
                     }`}>
                     {u}
                   </button>
@@ -908,12 +1145,14 @@ export function DotArtTool() {
               </div>
             </div>
           </div>
+        </div>
 
-          <hr className="border-neutral-100" />
+        <div className="flex-1 overflow-y-auto px-5 py-4 flex flex-col gap-5" style={{ scrollbarWidth: "none" }}>{/* settings */}
 
-          {/* Snap */}
           <div>
-            <div className="text-[10px] text-neutral-400 uppercase mb-1.5">Snap to</div>
+            <div className="flex items-center gap-1.5 text-[9px] font-semibold tracking-[0.2em] uppercase text-neutral-400 mb-2.5">
+              <Magnet size={9} /><span>Snap to</span>
+            </div>
             <div className="flex gap-1">
               {([
                 { value: "both" as SnapMode, label: "All 9" },
@@ -921,8 +1160,8 @@ export function DotArtTool() {
                 { value: "center" as SnapMode, label: "Centers" },
               ]).map(({ value, label }) => (
                 <button key={value} onClick={() => setSnapMode(value)}
-                  className={`flex-1 py-1.5 rounded text-[10px] transition-colors ${
-                    snapMode === value ? "bg-neutral-900 text-white" : "text-neutral-500 hover:bg-neutral-100"
+                  className={`flex-1 py-2 text-[10px] font-medium transition-all ${
+                    snapMode === value ? "bg-black text-white" : "text-neutral-500 hover:bg-neutral-100"
                   }`}>
                   {label}
                 </button>
@@ -930,63 +1169,83 @@ export function DotArtTool() {
             </div>
           </div>
 
-          {/* Background */}
           <div>
-            <div className="text-[10px] text-neutral-400 uppercase mb-1.5">Background</div>
+            <div className="text-[9px] font-semibold tracking-[0.2em] uppercase text-neutral-400 mb-2.5">Background</div>
             <div className="flex gap-1">
               {(["white", "black"] as const).map((bg) => (
-                <button key={bg} onClick={() => { setCanvasBg(bg); setGridColor(bg === "black" ? "#ffffff" : "#000000"); }}
-                  className={`flex-1 flex items-center justify-center gap-1.5 py-1.5 rounded text-[11px] transition-colors ${
-                    canvasBg === bg ? "bg-neutral-900 text-white" : "text-neutral-500 hover:bg-neutral-100"
+                <button key={bg}
+                  onClick={() => { setCanvasBg(bg); setGridColor(bg === "black" ? "#ffffff" : "#000000"); }}
+                  className={`flex-1 flex items-center justify-center gap-2 py-2 text-[11px] font-medium transition-all ${
+                    canvasBg === bg ? "bg-black text-white" : "text-neutral-500 hover:bg-neutral-100"
                   }`}>
-                  <span className="w-3 h-3 rounded-full border border-neutral-300" style={{ backgroundColor: bg }} />
+                  <span className="w-3 h-3 border border-neutral-300 shrink-0 inline-block" style={{ backgroundColor: bg }} />
                   {bg.charAt(0).toUpperCase() + bg.slice(1)}
                 </button>
               ))}
             </div>
           </div>
 
-          {/* Grid */}
           <div>
-            <div className="text-[10px] text-neutral-400 uppercase mb-1.5">Grid</div>
-            <div className="flex items-center gap-2 mb-2">
+            <div className="flex items-center gap-1.5 text-[9px] font-semibold tracking-[0.2em] uppercase text-neutral-400 mb-2.5">
+              <Grid3x3 size={9} /><span>Grid</span>
+            </div>
+            <div className="flex items-center gap-2.5 mb-3">
               <input type="color" value={gridColor} onChange={(e) => setGridColor(e.target.value)}
-                className="w-6 h-6 rounded cursor-pointer border border-neutral-200 p-0.5" />
-              <div className="flex-1 flex flex-col gap-1.5">
-                <div className="flex items-center gap-2">
-                  <span className="text-[10px] text-neutral-400 w-10">Opacity</span>
-                  <input type="range" min={0} max={1} step={0.01} value={gridOpacity} onChange={(e) => setGridOpacity(Number(e.target.value))} className="flex-1 accent-neutral-800" />
-                  <span className="text-[10px] text-neutral-400 font-mono w-7 text-right">{Math.round(gridOpacity * 100)}%</span>
-                </div>
-                <div className="flex items-center gap-2">
-                  <span className="text-[10px] text-neutral-400 w-10">Width</span>
-                  <input type="range" min={0.25} max={4} step={0.25} value={gridThickness} onChange={(e) => setGridThickness(Number(e.target.value))} className="flex-1 accent-neutral-800" />
-                  <span className="text-[10px] text-neutral-400 font-mono w-7 text-right">{gridThickness}px</span>
-                </div>
+                className="w-7 h-7 cursor-pointer border border-neutral-200 p-0.5 shrink-0" />
+              <span className="text-[10px] text-neutral-400 font-mono uppercase">{gridColor}</span>
+            </div>
+            <div className="flex flex-col gap-2.5">
+              <div className="flex items-center gap-2">
+                <span className="text-[10px] text-neutral-400 w-11 shrink-0">Opacity</span>
+                <input type="range" min={0} max={1} step={0.01} value={gridOpacity}
+                  onChange={(e) => setGridOpacity(Number(e.target.value))} className="flex-1 accent-neutral-800" />
+                <span className="text-[10px] text-neutral-500 font-mono w-7 text-right shrink-0">{Math.round(gridOpacity * 100)}%</span>
+              </div>
+              <div className="flex items-center gap-2">
+                <span className="text-[10px] text-neutral-400 w-11 shrink-0">Width</span>
+                <input type="range" min={0.25} max={4} step={0.25} value={gridThickness}
+                  onChange={(e) => setGridThickness(Number(e.target.value))} className="flex-1 accent-neutral-800" />
+                <span className="text-[10px] text-neutral-500 font-mono w-7 text-right shrink-0">{gridThickness}px</span>
               </div>
             </div>
           </div>
 
         </div>
 
-        {/* Footer — export + clear */}
-        <div className="px-3 py-2 border-t border-neutral-100 shrink-0">
-          <div className="flex gap-1 mb-1.5">
-            <button onClick={exportSVG} className="flex-1 flex items-center justify-center gap-1 py-2 rounded bg-neutral-900 text-white text-[11px] hover:bg-neutral-800 transition-colors">
+        <div className="px-4 py-3 bg-black shrink-0">
+          <div className="flex gap-1.5 mb-2">
+            <button onClick={exportSVG}
+              className="flex-1 flex items-center justify-center gap-1 py-2.5 bg-white/10 text-white text-[11px] font-medium hover:bg-white/20 transition-colors">
               <FileCode2 size={11} /> SVG
             </button>
-            <button onClick={exportPNG} className="flex-1 flex items-center justify-center gap-1 py-2 rounded bg-neutral-900 text-white text-[11px] hover:bg-neutral-800 transition-colors">
+            <button onClick={exportPNG}
+              className="flex-1 flex items-center justify-center gap-1 py-2.5 bg-white/10 text-white text-[11px] font-medium hover:bg-white/20 transition-colors">
               <FileImage size={11} /> PNG
             </button>
-            <button onClick={exportPDF} className="flex-1 flex items-center justify-center gap-1 py-2 rounded bg-blue-700 text-white text-[11px] hover:bg-blue-600 transition-colors">
+            <button onClick={exportPDF}
+              className="flex-1 flex items-center justify-center gap-1 py-2.5 bg-blue-500/25 text-blue-300 text-[11px] font-medium hover:bg-blue-500/40 transition-colors">
               <Printer size={11} /> PDF
             </button>
           </div>
-          <button onClick={() => { pushUndo(); setDots(new Map()); setSelectedKeys(new Set()); }}
-            className="w-full flex items-center justify-center gap-1 py-1.5 rounded text-[11px] text-red-500 hover:bg-red-50 transition-colors">
-            <Trash2 size={11} /> Clear
-          </button>
+          {confirmingClear ? (
+            <div className="flex gap-1.5">
+              <button onClick={() => { pushUndo(); setDots(new Map()); setSelectedKeys(new Set()); selectedKeysRef.current = new Set(); setConfirmingClear(false); }}
+                className="flex-1 flex items-center justify-center gap-1.5 py-2 text-[11px] font-medium bg-red-500 text-white hover:bg-red-600 transition-colors">
+                <Trash2 size={11} /> Clear
+              </button>
+              <button onClick={() => setConfirmingClear(false)}
+                className="flex-1 flex items-center justify-center py-2 text-[11px] font-medium text-white/70 hover:text-white hover:bg-white/10 transition-colors">
+                Cancel
+              </button>
+            </div>
+          ) : (
+            <button onClick={() => setConfirmingClear(true)} disabled={dots.size === 0}
+              className="w-full flex items-center justify-center gap-1.5 py-2 text-[11px] text-red-400 hover:bg-red-500/10 disabled:opacity-25 disabled:cursor-not-allowed transition-colors">
+              <Trash2 size={11} /> Clear Canvas
+            </button>
+          )}
         </div>
+
       </aside>
     </div>
   );
