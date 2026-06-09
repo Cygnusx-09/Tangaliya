@@ -1,0 +1,16 @@
+/* Inline color chooser (react-colorful) sized to fill the inspector panel */
+.dot-picker .react-colorful {
+  width: 100%;
+  height: 200px;
+}
+.dot-picker .react-colorful__saturation {
+  border-radius: 0;
+}
+.dot-picker .react-colorful__hue {
+  height: 22px;
+}
+.dot-picker .react-colorful__saturation-pointer,
+.dot-picker .react-colorful__hue-pointer {
+  width: 18px;
+  height: 18px;
+}

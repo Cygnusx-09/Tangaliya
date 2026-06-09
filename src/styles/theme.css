@@ -119,6 +119,70 @@
   --color-sidebar-ring: var(--sidebar-ring);
 }
 
+/* ── Tangaliya UI chrome palette (app shell only — never the artwork canvas) ── */
+.dotart {
+  --app-bg: #e8e8ea; /* matches --viewport so panel gutters blend into the canvas */
+  --app-fg: #444444;
+  --card: #f4f4f4;
+  --card-active: #ffffff;
+  --ctl: #ebebeb;
+  --ctl-hover: #e2e2e2;
+  --solid: #2a2a2a;
+  --solid-fg: #ffffff;
+  --txt-title: #3a3a3a;
+  --txt-1: #665e5e;
+  --txt-2: #868686;
+  --txt-3: #a0a0a0;
+  --brand: #000000;
+  --track: #e4e4e4;
+  --track-fill: rgba(208, 208, 208, 0.46);
+  --tick: #b8b8b8;
+  --overlay: #ffffff;
+  --overlay-border: #e5e5e5;
+  --overlay-fg: #525252;
+  --overlay-fg-muted: #a3a3a3;
+  --viewport: #e8e8ea;
+}
+
+.dotart.dark {
+  --app-bg: #0f0f0f; /* matches --viewport so panel gutters blend into the canvas */
+  --app-fg: #d4d4d4;
+  --card: #1f1f1f;
+  --card-active: #2e2e2e;
+  --ctl: #2a2a2a;
+  --ctl-hover: #353535;
+  --solid: #ededed;
+  --solid-fg: #1a1a1a;
+  --txt-title: #ededed;
+  --txt-1: #c9c4c4;
+  --txt-2: #8a8a8a;
+  --txt-3: #6b6b6b;
+  --brand: #ffffff;
+  --track: #2a2a2a;
+  --track-fill: rgba(255, 255, 255, 0.12);
+  --tick: #4a4a4a;
+  --overlay: #262626;
+  --overlay-border: #3a3a3a;
+  --overlay-fg: #d4d4d4;
+  --overlay-fg-muted: #808080;
+  --viewport: #0f0f0f;
+}
+
+/* Crossfade chrome colors only while a theme switch is in progress, so live
+   interactions (color picking, swatch previews) stay instant the rest of the time. */
+.dotart.theming,
+.dotart.theming * {
+  transition: background-color 320ms ease, color 320ms ease, border-color 320ms ease,
+    outline-color 320ms ease, fill 320ms ease, stroke 320ms ease;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .dotart.theming,
+  .dotart.theming * {
+    transition: none;
+  }
+}
+
 @layer base {
   * {
     @apply border-border outline-ring/50;

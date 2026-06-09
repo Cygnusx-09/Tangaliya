@@ -17,6 +17,9 @@ function figmaAssetResolver() {
 }
 
 export default defineConfig({
+  // GitHub Pages serves this project site under /Tangaliya/. Only apply that
+  // base in CI so local dev / preview keep working at the root.
+  base: process.env.GITHUB_ACTIONS ? '/Tangaliya/' : '/',
   plugins: [
     figmaAssetResolver(),
     // The React and Tailwind plugins are both required for Make, even if
