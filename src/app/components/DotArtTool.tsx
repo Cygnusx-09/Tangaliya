@@ -271,6 +271,9 @@ export function DotArtTool() {
   const [color, setColor] = useState("#FF2A2A");
   const [recentColors, setRecentColors] = useState<string[]>([]);
   const [radius, setRadius] = useState(3);
+  // Stroke snap reach, % of a lattice step: how far away a point "catches"
+  // the pen during a stroke. High = eager/loose, low = deliberate placement.
+  const [snapReach, setSnapReach] = useState(35);
   const [tool, setTool] = useState<Tool>("draw");
   const [snapMode, setSnapMode] = useState<SnapMode>("both");
   const [preview, setPreview] = useState<{ x: number; y: number } | null>(null);
@@ -364,6 +367,7 @@ export function DotArtTool() {
   const toolRef = useRef<Tool>("draw");
   const colorRef = useRef("#FF2A2A");
   const radiusRef = useRef(3);
+  const snapReachRef = useRef(35);
   const snapModeRef = useRef<SnapMode>("both");
   const canvasBoundsRef = useRef({ w: 0, h: 0 });
   const svgRef = useRef<SVGSVGElement>(null);
@@ -375,6 +379,7 @@ export function DotArtTool() {
   useEffect(() => { toolRef.current = tool; }, [tool]);
   useEffect(() => { colorRef.current = color; }, [color]);
   useEffect(() => { radiusRef.current = radius; }, [radius]);
+  useEffect(() => { snapReachRef.current = snapReach; }, [snapReach]);
   useEffect(() => { snapModeRef.current = snapMode; }, [snapMode]);
 
   const pxPerUnit = CELL_SIZE / cellPhysical;
@@ -716,7 +721,9 @@ export function DotArtTool() {
       const sy = Math.abs(dy) > dist * 0.3827 ? Math.sign(dy) : 0;
       if (!sx && !sy) break;
       const stepLen = spacing * Math.hypot(sx, sy);
-      if (dist < stepLen * 0.65) break; // hysteresis: hold this bead until the pen commits
+      // Hysteresis: hold this bead until the pen is within "snap reach" of the
+      // next point — the user-facing slider sets how eagerly points catch.
+      if (dist < stepLen * (1 - snapReachRef.current / 100)) break;
       const nx = last.x + sx * spacing, ny = last.y + sy * spacing;
       if (nx < 0 || nx > w || ny < 0 || ny > h) { last = null; break; } // re-seed on re-entry
       const pos = keyFromPosition(nx, ny);
@@ -1856,6 +1863,11 @@ export function DotArtTool() {
                 value={colorMixed ? 7 : activeRadius}
                 display={colorMixed ? "—" : `${activeRadius}`}
                 onChange={setActiveRadius} />
+              {!editingSelection && (
+                <ValueSlider label="Snap reach" min={10} max={70} step={5}
+                  value={snapReach} display={`${snapReach}%`}
+                  onChange={setSnapReach} />
+              )}
             </>
           )}
 
@@ -1926,6 +1938,9 @@ export function DotArtTool() {
               <ValueSlider label="Radius" min={1} max={14}
                 value={radius} display={`${radius}`}
                 onChange={setRadius} />
+              <ValueSlider label="Snap reach" min={10} max={70} step={5}
+                value={snapReach} display={`${snapReach}%`}
+                onChange={setSnapReach} />
               <p className="text-[13px] text-[var(--txt-3)] leading-relaxed px-1">
                 Click or drag across the canvas to remove dots within the radius.
               </p>
