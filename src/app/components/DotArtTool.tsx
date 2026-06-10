@@ -1637,7 +1637,7 @@ export function DotArtTool() {
         </div>
 
         {/* Controls card */}
-        <div className="bg-[var(--card)] rounded-3xl p-4 flex-1 overflow-y-auto flex flex-col gap-5" style={{ scrollbarWidth: "none" }}>
+        <div className="bg-[var(--card)] rounded-3xl p-4 flex-1 overflow-y-auto flex flex-col gap-5 [&>*]:shrink-0" style={{ scrollbarWidth: "none" }}>
 
           {/* Tools */}
           <div>
@@ -2032,7 +2032,7 @@ export function DotArtTool() {
 
       {/* ── Right panel — context inspector for the selected element ── */}
       <aside className={`${compact ? `fixed right-0 top-0 z-50 bg-[var(--app-bg)] shadow-2xl transition-transform duration-300 ${rightOpen ? "translate-x-0" : "translate-x-full"}` : "relative"} w-[300px] max-w-[88vw] shrink-0 h-dvh p-4 flex flex-col gap-4 overflow-hidden`}>
-        <div className="bg-[var(--card)] rounded-3xl p-4 flex-1 overflow-y-auto flex flex-col gap-4" style={{ scrollbarWidth: "none" }}>
+        <div className="bg-[var(--card)] rounded-3xl p-4 flex-1 overflow-y-auto flex flex-col gap-4 [&>*]:shrink-0" style={{ scrollbarWidth: "none" }}>
 
           <div className="flex items-center justify-between">
             <span className="text-[19px] font-medium text-[var(--txt-title)] tracking-[-0.4px]">{ctxTitle}</span>
