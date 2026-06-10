@@ -782,19 +782,6 @@ export function DotArtTool() {
   const penActiveRef = useRef(false);
   const fingerDrawRef = useRef<number | null>(null); // pointerId of a finger mid-stroke
 
-  // TEMP DEBUG — on-device pointer-event counters for the iPad stroke bug.
-  // Remove this block, the dbg() calls in the handlers, and the overlay div
-  // once diagnosed. Touches only refs, so it's safe to omit from deps.
-  const dbgRef = useRef<HTMLDivElement>(null);
-  const dbgCounts = useRef({ d: 0, m: 0, pm: 0, u: 0, c: 0, l: 0, t: "-" });
-  const dbg = (k: "d" | "m" | "pm" | "u" | "c" | "l", type?: string) => {
-    const s = dbgCounts.current;
-    s[k]++;
-    if (type) s.t = type;
-    if (dbgRef.current) dbgRef.current.textContent =
-      `dn ${s.d} · mv ${s.m} · paint ${s.pm} · up ${s.u} · CANCEL ${s.c} · leave ${s.l} · ${s.t} ${isPaintingRef.current ? "▶" : "·"} f${touchesRef.current.size}`;
-  };
-
   // Belt-and-braces for Safari: even with touch-action none, WebKit can hand
   // a Pencil drag to the scroller and pointercancel the stroke unless native
   // touchmove is actively prevented (must be a non-passive DOM listener —
@@ -841,7 +828,6 @@ export function DotArtTool() {
   }, []);
 
   const handlePointerDown = useCallback((e: React.PointerEvent) => {
-    dbg("d", e.pointerType); // TEMP DEBUG
     // Only strokes that start on the canvas SVG count — the container div
     // also holds zoom buttons, panel FABs, and the webcam overlay.
     if (!svgRef.current || !svgRef.current.contains(e.target as Node)) return;
@@ -960,7 +946,6 @@ export function DotArtTool() {
   }, [getSVGPoint, selectSameColor]);
 
   const handlePointerMove = useCallback((e: React.PointerEvent) => {
-    dbg("m", e.pointerType); // TEMP DEBUG
     if (e.pointerType === "touch") {
       if (penActiveRef.current) return;
       if (fingerDrawRef.current === e.pointerId && touchesRef.current.size === 1) {
@@ -980,7 +965,6 @@ export function DotArtTool() {
 
     const world = getSVGPoint(e);
     if (!world) return;
-    if (isPaintingRef.current) dbg("pm"); // TEMP DEBUG: move arrived while painting armed
 
     if (toolRef.current === "select") {
       if (isDraggingDotsRef.current && dragStartWorldRef.current) {
@@ -1045,7 +1029,6 @@ export function DotArtTool() {
   }, [getSVGPoint, applyDrawTool, paintStrokeTo, handleTouchNav]);
 
   const handlePointerUp = useCallback((e: React.PointerEvent) => {
-    dbg("u", e.pointerType); // TEMP DEBUG
     if (e.pointerType === "touch") {
       touchesRef.current.delete(e.pointerId);
       if (touchesRef.current.size < 2) gestureRef.current = null;
@@ -1097,8 +1080,7 @@ export function DotArtTool() {
     eraseStrokeRef.current = null;
   }, []);
 
-  const handlePointerLeave = useCallback((e: React.PointerEvent) => {
-    dbg("l", e.pointerType); // TEMP DEBUG
+  const handlePointerLeave = useCallback(() => {
     // iPad WebKit fires ghost pointerleave events mid-stroke, with the pen
     // still in contact and captured — resetting here disarmed painting after
     // the first dot, so trails never formed. While any press-driven
@@ -1117,7 +1099,6 @@ export function DotArtTool() {
   }, []);
 
   const handlePointerCancel = useCallback((e: React.PointerEvent) => {
-    dbg("c", e.pointerType); // TEMP DEBUG
     if (e.pointerType === "touch") {
       touchesRef.current.delete(e.pointerId);
       if (touchesRef.current.size < 2) gestureRef.current = null;
@@ -1782,10 +1763,6 @@ export function DotArtTool() {
         onPointerUp={handlePointerUp} onPointerLeave={handlePointerLeave}
         onPointerCancel={handlePointerCancel}
         onDoubleClick={handleDoubleClick}>
-        {/* TEMP DEBUG — pointer-event counters; remove after iPad diagnosis */}
-        <div ref={dbgRef} className="pointer-events-none absolute left-2 top-2 z-50 rounded bg-black/75 px-2 py-1 font-mono text-[11px] leading-tight text-lime-300">
-          dbg ready — draw one stroke
-        </div>
         <svg ref={svgRef} width={viewportSize.width} height={viewportSize.height}
           className="absolute inset-0 select-none" style={{ cursor, touchAction: "none" }}>
 
