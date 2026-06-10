@@ -773,12 +773,14 @@ export function DotArtTool() {
     });
   }, []);
 
-  // ── Touch (finger) navigation: one-finger pan, two-finger pinch-zoom. ──
-  // Pen / mouse draw & select; fingers navigate. While a pen is actively
-  // drawing, touch points are ignored — palm rejection.
+  // ── Touch (finger) input: one finger draws like the pen, two fingers ──
+  // pan + pinch-zoom together. While a pen is actively drawing, touch
+  // points are ignored — palm rejection. A second finger landing mid-stroke
+  // abandons the one-finger stroke and switches to navigation.
   const touchesRef = useRef<Map<number, { x: number; y: number }>>(new Map());
   const gestureRef = useRef<{ dist: number; cx: number; cy: number } | null>(null);
   const penActiveRef = useRef(false);
+  const fingerDrawRef = useRef<number | null>(null); // pointerId of a finger mid-stroke
 
   // Belt-and-braces for Safari: even with touch-action none, WebKit can hand
   // a Pencil drag to the scroller and pointercancel the stroke unless native
@@ -801,15 +803,9 @@ export function DotArtTool() {
       return;
     }
     if (!touchesRef.current.has(e.pointerId)) return;
-    const prev = touchesRef.current.get(e.pointerId)!;
-    const cur = { x: e.clientX, y: e.clientY };
-    touchesRef.current.set(e.pointerId, cur);
+    touchesRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
     const pts = [...touchesRef.current.values()];
-    if (pts.length === 1) {
-      // one-finger pan
-      const newPan = { x: panRef.current.x + (cur.x - prev.x), y: panRef.current.y + (cur.y - prev.y) };
-      panRef.current = newPan; setPan({ ...newPan });
-    } else if (pts.length >= 2) {
+    if (pts.length >= 2) {
       // two-finger pinch-zoom (anchored at the centroid) + drag-pan
       const [a, b] = pts;
       const dist = Math.hypot(a.x - b.x, a.y - b.y);
@@ -839,9 +835,23 @@ export function DotArtTool() {
       if (penActiveRef.current) return; // palm rejection while a pen is drawing
       e.preventDefault();
       handleTouchNav(e, "down");
-      return;
+      if (touchesRef.current.size >= 2) {
+        // 2nd finger lands: abandon any one-finger stroke, become a gesture
+        if (fingerDrawRef.current !== null) {
+          fingerDrawRef.current = null;
+          isPaintingRef.current = false;
+          lastPaintRef.current = null;
+          eraseStrokeRef.current = null;
+          isDraggingDotsRef.current = false;
+          isMarqueeingRef.current = false;
+          setMarqueeBox(null);
+        }
+        return;
+      }
+      // single finger: fall through and draw exactly like the pen
+      fingerDrawRef.current = e.pointerId;
     }
-    // ── pen / mouse: draw, erase, select ──
+    // ── pen / mouse / single finger: draw, erase, select ──
     if (e.button === 1 || (e.button === 0 && spaceDownRef.current)) {
       e.preventDefault();
       isPanningRef.current = true;
@@ -852,7 +862,9 @@ export function DotArtTool() {
     if (e.button !== 0) return;
     e.preventDefault();
     try { (e.currentTarget as Element).setPointerCapture(e.pointerId); } catch { /* ignore */ }
-    penActiveRef.current = true;
+    // Only a real pen/mouse arms palm rejection — a drawing finger must not
+    // block the 2nd finger that converts the stroke into a pan/zoom gesture.
+    if (e.pointerType !== "touch") penActiveRef.current = true;
 
     const world = getSVGPoint(e);
     if (!world) return;
@@ -936,8 +948,14 @@ export function DotArtTool() {
   const handlePointerMove = useCallback((e: React.PointerEvent) => {
     if (e.pointerType === "touch") {
       if (penActiveRef.current) return;
-      handleTouchNav(e, "move");
-      return;
+      if (fingerDrawRef.current === e.pointerId && touchesRef.current.size === 1) {
+        // keep the nav position fresh so a 2nd finger can take over cleanly
+        touchesRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
+        // fall through: the drawing finger paints like the pen
+      } else {
+        handleTouchNav(e, "move");
+        return;
+      }
     }
     if (isPanningRef.current && panStartRef.current) {
       const newPan = { x: panStartRef.current.px + (e.clientX - panStartRef.current.mx), y: panStartRef.current.py + (e.clientY - panStartRef.current.my) };
@@ -1014,7 +1032,9 @@ export function DotArtTool() {
     if (e.pointerType === "touch") {
       touchesRef.current.delete(e.pointerId);
       if (touchesRef.current.size < 2) gestureRef.current = null;
-      return;
+      if (fingerDrawRef.current !== e.pointerId) return;
+      fingerDrawRef.current = null;
+      // fall through: finish the finger stroke exactly like the pen
     }
     try { (e.currentTarget as Element).releasePointerCapture(e.pointerId); } catch { /* ignore */ }
     penActiveRef.current = false;
@@ -1063,6 +1083,7 @@ export function DotArtTool() {
   const handlePointerLeave = useCallback(() => {
     setPreview(null);
     isPaintingRef.current = false;
+    fingerDrawRef.current = null;
     lastPaintRef.current = null;
     eraseStrokeRef.current = null;
     isPanningRef.current = false;
@@ -1075,7 +1096,9 @@ export function DotArtTool() {
     if (e.pointerType === "touch") {
       touchesRef.current.delete(e.pointerId);
       if (touchesRef.current.size < 2) gestureRef.current = null;
-      return;
+      if (fingerDrawRef.current !== e.pointerId) return;
+      fingerDrawRef.current = null;
+      // fall through: reset stroke state like a cancelled pen
     }
     penActiveRef.current = false;
     isPaintingRef.current = false;
@@ -1735,7 +1758,7 @@ export function DotArtTool() {
         onPointerCancel={handlePointerCancel}
         onDoubleClick={handleDoubleClick}>
         <svg ref={svgRef} width={viewportSize.width} height={viewportSize.height}
-          className="absolute inset-0 select-none" style={{ cursor }}>
+          className="absolute inset-0 select-none" style={{ cursor, touchAction: "none" }}>
 
           <rect width={viewportSize.width} height={viewportSize.height} style={{ fill: "var(--viewport)" }} />
 
