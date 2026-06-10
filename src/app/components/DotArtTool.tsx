@@ -106,6 +106,13 @@ function keyFromPosition(x: number, y: number): { key: string; x: number; y: num
   return { key: getKey(halfCol, halfRow), x: snappedX, y: snappedY };
 }
 
+function distToSegment(px: number, py: number, x1: number, y1: number, x2: number, y2: number): number {
+  const dx = x2 - x1, dy = y2 - y1;
+  const len2 = dx * dx + dy * dy;
+  const t = len2 ? Math.max(0, Math.min(1, ((px - x1) * dx + (py - y1) * dy) / len2)) : 0;
+  return Math.hypot(px - (x1 + t * dx), py - (y1 + t * dy));
+}
+
 function findDotAt(dots: Map<string, Dot>, wx: number, wy: number): Dot | null {
   let closest: Dot | null = null;
   let closestDist = Infinity;
@@ -274,6 +281,9 @@ export function DotArtTool() {
   // Stroke snap reach, % of a lattice step: how far away a point "catches"
   // the pen during a stroke. High = eager/loose, low = deliberate placement.
   const [snapReach, setSnapReach] = useState(35);
+  // Eraser size in world px — its own state, deliberately NOT shared with the
+  // draw dot radius (resizing the eraser must not change the brush).
+  const [eraseRadius, setEraseRadius] = useState(8);
   const [tool, setTool] = useState<Tool>("draw");
   const [snapMode, setSnapMode] = useState<SnapMode>("both");
   const [preview, setPreview] = useState<{ x: number; y: number } | null>(null);
@@ -368,6 +378,7 @@ export function DotArtTool() {
   const colorRef = useRef("#FF2A2A");
   const radiusRef = useRef(3);
   const snapReachRef = useRef(35);
+  const eraseRadiusRef = useRef(8);
   const snapModeRef = useRef<SnapMode>("both");
   const canvasBoundsRef = useRef({ w: 0, h: 0 });
   const svgRef = useRef<SVGSVGElement>(null);
@@ -380,6 +391,7 @@ export function DotArtTool() {
   useEffect(() => { colorRef.current = color; }, [color]);
   useEffect(() => { radiusRef.current = radius; }, [radius]);
   useEffect(() => { snapReachRef.current = snapReach; }, [snapReach]);
+  useEffect(() => { eraseRadiusRef.current = eraseRadius; }, [eraseRadius]);
   useEffect(() => { snapModeRef.current = snapMode; }, [snapMode]);
 
   const pxPerUnit = CELL_SIZE / cellPhysical;
@@ -696,6 +708,24 @@ export function DotArtTool() {
     });
   }, []);
 
+  // ── Area eraser ──────────────────────────────────────────────────────────
+  // The eraser is a swept circle, not a snap-point deleter: every dot whose
+  // body overlaps the segment from the previous pen sample to this one goes,
+  // so fast drags can't skip dots and the slider radius is the real hit area.
+  const eraseStrokeRef = useRef<{ x: number; y: number } | null>(null);
+
+  const eraseAlong = useCallback((x1: number, y1: number, x2: number, y2: number) => {
+    const reach = eraseRadiusRef.current;
+    setDots((prev) => {
+      let changed = false;
+      const next = new Map(prev);
+      for (const d of prev.values()) {
+        if (distToSegment(d.x, d.y, x1, y1, x2, y2) <= reach + d.radius) { next.delete(d.key); changed = true; }
+      }
+      return changed ? next : prev;
+    });
+  }, []);
+
   // ── Brush-style stroke walk ──────────────────────────────────────────────
   // Pointer moves arrive once per frame (Safari coalesces the Pencil's 240Hz
   // stream), so snapping each event independently leaves gaps on fast strokes
@@ -877,10 +907,18 @@ export function DotArtTool() {
 
     pushUndo();
     isPaintingRef.current = true;
+
+    if (toolRef.current === "erase") {
+      setPreview({ x: world.x, y: world.y });
+      eraseStrokeRef.current = { x: world.x, y: world.y };
+      eraseAlong(world.x, world.y, world.x, world.y);
+      return;
+    }
+
     const snap = getNearestSnap(world.x, world.y, CELL_SIZE, snapModeRef.current, canvasBoundsRef.current.w, canvasBoundsRef.current.h);
     if (snap) { setPreview({ x: snap.x, y: snap.y }); applyDrawTool(snap.key, snap.x, snap.y); }
     lastPaintRef.current = snap ? { x: snap.x, y: snap.y } : null;
-  }, [getSVGPoint, applyDrawTool, pushUndo, pushRecentColor, handleTouchNav]);
+  }, [getSVGPoint, applyDrawTool, eraseAlong, pushUndo, pushRecentColor, handleTouchNav]);
 
   const handleDoubleClick = useCallback((e: React.MouseEvent) => {
     // Select-same-color only makes sense in the select tool. Without this
@@ -928,6 +966,24 @@ export function DotArtTool() {
       } else {
         const hit = findDotAt(dotsRef.current, world.x, world.y);
         setHoveredDotKey(hit ? hit.key : null);
+      }
+      return;
+    }
+
+    if (toolRef.current === "erase") {
+      // The eraser cursor follows the pen freely (it's an area, not a snap),
+      // sweeping a segment per sample so fast drags can't skip dots.
+      setPreview({ x: world.x, y: world.y });
+      if (isPaintingRef.current) {
+        const native = e.nativeEvent as PointerEvent;
+        const samples = native.getCoalescedEvents?.() ?? [];
+        for (const ev of samples.length ? samples : [native]) {
+          const pt = getSVGPoint(ev as unknown as React.MouseEvent);
+          if (!pt) continue;
+          const from = eraseStrokeRef.current ?? pt;
+          eraseAlong(from.x, from.y, pt.x, pt.y);
+          eraseStrokeRef.current = { x: pt.x, y: pt.y };
+        }
       }
       return;
     }
@@ -1001,12 +1057,14 @@ export function DotArtTool() {
 
     isPaintingRef.current = false;
     lastPaintRef.current = null;
+    eraseStrokeRef.current = null;
   }, []);
 
   const handlePointerLeave = useCallback(() => {
     setPreview(null);
     isPaintingRef.current = false;
     lastPaintRef.current = null;
+    eraseStrokeRef.current = null;
     isPanningRef.current = false;
     panStartRef.current = null;
     setIsGrabbing(false);
@@ -1022,6 +1080,7 @@ export function DotArtTool() {
     penActiveRef.current = false;
     isPaintingRef.current = false;
     lastPaintRef.current = null;
+    eraseStrokeRef.current = null;
     isDraggingDotsRef.current = false;
     isMarqueeingRef.current = false;
     setMarqueeBox(null);
@@ -1735,7 +1794,7 @@ export function DotArtTool() {
               <circle cx={preview.x} cy={preview.y} r={radius} fill={color} opacity={0.4} style={{ pointerEvents: "none" }} />
             )}
             {preview && tool === "erase" && (
-              <circle cx={preview.x} cy={preview.y} r={Math.max(radius, 4)} fill="none"
+              <circle cx={preview.x} cy={preview.y} r={eraseRadius} fill="none"
                 stroke="#ef4444" strokeWidth={1.5 / zoom} strokeDasharray={`${3 / zoom},${2 / zoom}`}
                 style={{ pointerEvents: "none" }} />
             )}
@@ -1955,14 +2014,11 @@ export function DotArtTool() {
             <>
               <div className="rounded-2xl h-40 bg-[var(--ctl)] flex items-center justify-center">
                 <span className="rounded-full border-2 border-dashed border-[#f23a3a]"
-                  style={{ width: Math.max(radius * 4, 16), height: Math.max(radius * 4, 16) }} />
+                  style={{ width: Math.max(eraseRadius * 2, 16), height: Math.max(eraseRadius * 2, 16) }} />
               </div>
-              <ValueSlider label="Radius" min={1} max={14}
-                value={radius} display={`${radius}`}
-                onChange={setRadius} />
-              <ValueSlider label="Snap reach" min={10} max={70} step={5}
-                value={snapReach} display={`${snapReach}%`}
-                onChange={setSnapReach} />
+              <ValueSlider label="Radius" min={2} max={40}
+                value={eraseRadius} display={`${eraseRadius}`}
+                onChange={setEraseRadius} />
               <p className="text-[13px] text-[var(--txt-3)] leading-relaxed px-1">
                 Click or drag across the canvas to remove dots within the radius.
               </p>
