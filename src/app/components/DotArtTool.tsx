@@ -750,6 +750,18 @@ export function DotArtTool() {
   const gestureRef = useRef<{ dist: number; cx: number; cy: number } | null>(null);
   const penActiveRef = useRef(false);
 
+  // Belt-and-braces for Safari: even with touch-action none, WebKit can hand
+  // a Pencil drag to the scroller and pointercancel the stroke unless native
+  // touchmove is actively prevented (must be a non-passive DOM listener —
+  // React's synthetic handlers can't preventDefault touchmove).
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    const block = (ev: TouchEvent) => ev.preventDefault();
+    el.addEventListener("touchmove", block, { passive: false });
+    return () => el.removeEventListener("touchmove", block);
+  }, []);
+
   const handleTouchNav = useCallback((e: React.PointerEvent, phase: "down" | "move") => {
     const svg = svgRef.current;
     if (!svg) return;
@@ -790,6 +802,9 @@ export function DotArtTool() {
   }, []);
 
   const handlePointerDown = useCallback((e: React.PointerEvent) => {
+    // Only strokes that start on the canvas SVG count — the container div
+    // also holds zoom buttons, panel FABs, and the webcam overlay.
+    if (!svgRef.current || !svgRef.current.contains(e.target as Node)) return;
     if (e.pointerType === "touch") {
       if (penActiveRef.current) return; // palm rejection while a pen is drawing
       e.preventDefault();
@@ -872,6 +887,7 @@ export function DotArtTool() {
     // gate, two quick pen taps while drawing register as a double-click and
     // surprise-select dots mid-stroke.
     if (toolRef.current !== "select") return;
+    if (!svgRef.current || !svgRef.current.contains(e.target as Node)) return;
     if (e.button !== 0) return;
     const world = getSVGPoint(e);
     if (!world) return;
@@ -1648,13 +1664,19 @@ export function DotArtTool() {
       </aside>
 
       {/* ── Canvas ── */}
-      <div ref={containerRef} className="flex-1 relative overflow-hidden">
+      {/* Pointer handlers live on this HTML div, NOT the <svg>: WebKit's
+          setPointerCapture is broken on SVG elements, and without capture
+          Safari pointercancels a Pencil drag as a system gesture — strokes
+          died after the first dot on iPad. handlePointerDown gates on the
+          event target so the overlay buttons inside this div never paint. */}
+      <div ref={containerRef} className="flex-1 relative overflow-hidden"
+        style={{ touchAction: "none" }}
+        onPointerDown={handlePointerDown} onPointerMove={handlePointerMove}
+        onPointerUp={handlePointerUp} onPointerLeave={handlePointerLeave}
+        onPointerCancel={handlePointerCancel}
+        onDoubleClick={handleDoubleClick}>
         <svg ref={svgRef} width={viewportSize.width} height={viewportSize.height}
-          className="absolute inset-0 select-none" style={{ cursor, touchAction: "none" }}
-          onPointerDown={handlePointerDown} onPointerMove={handlePointerMove}
-          onPointerUp={handlePointerUp} onPointerLeave={handlePointerLeave}
-          onPointerCancel={handlePointerCancel}
-          onDoubleClick={handleDoubleClick}>
+          className="absolute inset-0 select-none" style={{ cursor }}>
 
           <rect width={viewportSize.width} height={viewportSize.height} style={{ fill: "var(--viewport)" }} />
 
