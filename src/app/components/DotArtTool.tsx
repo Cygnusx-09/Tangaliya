@@ -1478,9 +1478,20 @@ export function DotArtTool() {
     clearRafRef.current = requestAnimationFrame(tick);
   }, [pushUndo, cancelClearHold]);
 
+  const applyCellSize = (next: number) => {
+    // Lock the canvas frame on screen while the grid rescales inside it.
+    // Internal raster width is (physical W / cell) × CELL_SIZE, so a cell
+    // change scales every world coordinate by old/next — counter-scaling
+    // the zoom by next/old keeps every zoom × world product identical and
+    // the canvas rectangle doesn't move a pixel (pan needs no correction).
+    const z = Math.min(Math.max(zoomRef.current * (next / cellPhysical), MIN_ZOOM), MAX_ZOOM);
+    zoomRef.current = z;
+    setZoom(z);
+    setCellPhysical(next);
+  };
   const commitCell = () => {
     const parsed = parseFloat(cellInput);
-    if (!isNaN(parsed) && parsed > 0) setCellPhysical(parsed);
+    if (!isNaN(parsed) && parsed > 0) applyCellSize(parsed);
     else setCellInput(String(cellPhysical));
   };
   const commitW = () => {
@@ -1496,7 +1507,7 @@ export function DotArtTool() {
   const stepCell = (dir: 1 | -1) => {
     const stepBy = unit === "in" ? 0.1 : unit === "cm" ? 0.5 : 1;
     const next = roundForUnit(Math.max(stepBy, cellPhysical + dir * stepBy), unit);
-    setCellPhysical(next);
+    applyCellSize(next);
     setCellInput(String(next));
   };
 
