@@ -1,8 +1,10 @@
 name: Deploy to GitHub Pages
 
+# Deploy only from main — the github-pages environment rejects other branches
+# (environment protection), which made every feature-branch run end red.
 on:
   push:
-    branches: [experiment/figma-redesign, main]
+    branches: [main]
   workflow_dispatch:
 
 # Allow the workflow to publish to Pages.
