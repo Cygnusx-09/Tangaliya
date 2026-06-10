@@ -1,6 +1,6 @@
 import { useState, useRef, useCallback, useEffect } from "react";
 import { HexColorPicker } from "react-colorful";
-import { Eraser, Pen, Trash2, ZoomIn, ZoomOut, Maximize2, Undo2, Redo2, MousePointer2, FileImage, FileCode2, Printer, Grid3x3, Magnet, Ruler, Plus, Minus, Droplet, PaintBucket, Moon, Sun, Volume2, VolumeX, Hand, GripHorizontal, Menu, SlidersHorizontal } from "lucide-react";
+import { Eraser, Pen, Trash2, ZoomIn, ZoomOut, Maximize2, Undo2, Redo2, MousePointer2, FileImage, FileCode2, Printer, Grid3x3, Magnet, Ruler, Plus, Minus, Droplet, PaintBucket, Moon, Sun, Volume2, VolumeX, Hand, GripHorizontal, Menu, SlidersHorizontal, Dices } from "lucide-react";
 import { sfx, setSfxMuted } from "../sounds";
 import { Progress } from "./ui/progress";
 
@@ -30,6 +30,17 @@ const PALETTE = [
 
 // Unit conversion (everything goes through mm internally for conversion)
 const TO_MM: Record<Unit, number> = { mm: 1, cm: 10, in: 25.4 };
+function hslToHex(h: number, s: number, l: number): string {
+  s /= 100; l /= 100;
+  const a = s * Math.min(l, 1 - l);
+  const f = (n: number) => {
+    const k = (n + h / 30) % 12;
+    const c = l - a * Math.max(-1, Math.min(k - 3, 9 - k, 1));
+    return Math.round(255 * c).toString(16).padStart(2, "0");
+  };
+  return `#${f(0)}${f(8)}${f(4)}`;
+}
+
 function convertUnit(value: number, from: Unit, to: Unit): number {
   return (value * TO_MM[from]) / TO_MM[to];
 }
@@ -481,6 +492,31 @@ export function DotArtTool() {
     }
     pushRecentColor(c);
   }, [pushUndo, pushRecentColor]);
+
+  // Random-but-harmonious starter combo: one hue anchors ground + grid (the
+  // grid stays a low-contrast whisper of the ground), the brush takes a
+  // rotated hue with guaranteed lightness contrast. Dark grounds get equal
+  // weight — traditional Tangaliya is bright dots on dark wool. Deliberately
+  // NOT chooseColor: shuffling should never recolor a live selection.
+  const shuffleColors = useCallback(() => {
+    const h = Math.floor(Math.random() * 360);
+    const dark = Math.random() < 0.5;
+    const bg = dark
+      ? hslToHex(h, 25 + Math.random() * 35, 8 + Math.random() * 10)
+      : hslToHex(h, 8 + Math.random() * 25, 90 + Math.random() * 7);
+    const grid = dark
+      ? hslToHex(h, 15 + Math.random() * 15, 28 + Math.random() * 10)
+      : hslToHex(h, 10 + Math.random() * 15, 68 + Math.random() * 10);
+    const bh = (h + 90 + Math.random() * 180) % 360;
+    const brush = dark
+      ? hslToHex(bh, 65 + Math.random() * 30, 55 + Math.random() * 12)
+      : hslToHex(bh, 60 + Math.random() * 35, 38 + Math.random() * 14);
+    setCanvasBg(bg);
+    setGridColor(grid);
+    setColor(brush);
+    pushRecentColor(brush);
+    sfx.ui();
+  }, [pushRecentColor]);
 
   const updateSelectedDots = useCallback((patch: Partial<Pick<Dot, "color" | "radius">>) => {
     if (selectedKeysRef.current.size === 0) return;
@@ -2046,6 +2082,12 @@ export function DotArtTool() {
                   })}
                 </div>
               </div>
+
+              <button onClick={shuffleColors} title="Random background + grid + brush combination"
+                className="w-full flex items-center justify-center gap-1.5 py-2.5 rounded-xl bg-[var(--ctl)] text-[var(--txt-1)] text-[13px] hover:bg-[var(--ctl-hover)] transition-all">
+                <Dices className="w-4 h-4" />
+                Shuffle colors
+              </button>
 
               <ValueSlider label="Dot Size" min={1} max={14}
                 value={colorMixed ? 7 : activeRadius}
