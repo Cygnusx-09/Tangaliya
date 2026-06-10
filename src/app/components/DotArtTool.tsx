@@ -173,18 +173,59 @@ function buildSVGString(
 
 // Pill slider: label sits on a filled track, tick dots mark the range,
 // a vertical bar is the thumb, and the current value shows large on the right.
-// A transparent native range input on top supplies drag / keyboard / a11y.
+// The whole pill is a pointer scrub surface (iOS range inputs only drag from
+// the thumb itself, which is hopeless with a finger or Pencil): pressing the
+// track jumps to that value and drags absolutely; pressing the label / value
+// end-zones drags relatively from the current value, so a tap there can't
+// slam the value to min/max. A hidden native range input stays for keyboard.
 function ValueSlider({
   label, value, min, max, step = 1, onChange, display,
 }: {
   label: string; value: number; min: number; max: number;
   step?: number; onChange: (v: number) => void; display?: string;
 }) {
+  const rowRef = useRef<HTMLDivElement>(null);
+  const dragRef = useRef<{ startX: number; startValue: number; relative: boolean } | null>(null);
   const frac = Math.min(1, Math.max(0, (value - min) / (max - min)));
   const track = "(100% - var(--tl) - var(--tr))"; // travel region for the thumb
+  const TL = 84, TR = 44;
+
+  const quantize = (raw: number) => {
+    const stepped = min + Math.round((raw - min) / step) * step;
+    const decimals = (String(step).split(".")[1] ?? "").length;
+    return Math.min(max, Math.max(min, Number(stepped.toFixed(decimals))));
+  };
+  const emit = (v: number) => {
+    if (v === value) return;
+    onChange(v);
+    sfx.slider((v - min) / (max - min));
+  };
+  const handleScrub = (e: React.PointerEvent, phase: "down" | "move") => {
+    const row = rowRef.current;
+    if (!row) return;
+    const rect = row.getBoundingClientRect();
+    const trackW = rect.width - TL - TR;
+    if (phase === "down") {
+      const x = e.clientX - rect.left;
+      const relative = x < TL || x > rect.width - TR;
+      dragRef.current = { startX: e.clientX, startValue: value, relative };
+      try { row.setPointerCapture(e.pointerId); } catch { /* ignore */ }
+      if (!relative) emit(quantize(min + ((x - TL) / trackW) * (max - min)));
+      return;
+    }
+    const drag = dragRef.current;
+    if (!drag) return;
+    if (drag.relative) emit(quantize(drag.startValue + ((e.clientX - drag.startX) / trackW) * (max - min)));
+    else emit(quantize(min + ((e.clientX - rect.left - TL) / trackW) * (max - min)));
+  };
   return (
     <div
-      className="relative flex items-center h-11 rounded-[12px] bg-[var(--track)] select-none"
+      ref={rowRef}
+      onPointerDown={(e) => { if (e.pointerType === "mouse" && e.button !== 0) return; e.preventDefault(); handleScrub(e, "down"); }}
+      onPointerMove={(e) => handleScrub(e, "move")}
+      onPointerUp={() => { dragRef.current = null; }}
+      onPointerCancel={() => { dragRef.current = null; }}
+      className="relative flex items-center h-11 rounded-[12px] bg-[var(--track)] select-none touch-none cursor-pointer"
       style={{ "--tl": "84px", "--tr": "44px" } as React.CSSProperties}
     >
       {/* filled pill from the left edge up to the thumb */}
@@ -216,7 +257,7 @@ function ValueSlider({
         type="range" min={min} max={max} step={step} value={value}
         aria-label={label}
         onChange={(e) => { const v = Number(e.target.value); onChange(v); sfx.slider((v - min) / (max - min)); }}
-        className="absolute top-0 bottom-0 m-0 opacity-0 cursor-pointer"
+        className="absolute top-0 bottom-0 m-0 opacity-0 pointer-events-none"
         style={{ left: "var(--tl)", right: "var(--tr)" }}
       />
     </div>
@@ -650,6 +691,51 @@ export function DotArtTool() {
     });
   }, []);
 
+  // ── Brush-style stroke walk ──────────────────────────────────────────────
+  // Pointer moves arrive once per frame (Safari coalesces the Pencil's 240Hz
+  // stream), so snapping each event independently leaves gaps on fast strokes
+  // and double-places edge midpoints on diagonals (at 45° two edge points are
+  // exactly equidistant from the stroke, so jitter picks both). Instead we
+  // step the last painted bead toward the pen in 8-direction lattice moves:
+  // continuous lines at any speed, and a diagonal lands as one clean
+  // corner→center→corner chain. The direction is bucketed into 45° sectors
+  // and a step only fires once the pen is decisively into the next cell
+  // (hysteresis), so hand wobble can't stutter sideways.
+  const lastPaintRef = useRef<{ x: number; y: number } | null>(null);
+
+  const paintStrokeTo = useCallback((wx: number, wy: number) => {
+    const spacing = snapModeRef.current === "both" ? HALF_CELL : CELL_SIZE;
+    const { w, h } = canvasBoundsRef.current;
+    const steps: { key: string; x: number; y: number }[] = [];
+    let last = lastPaintRef.current;
+    for (let guard = 0; last && guard < 256; guard++) {
+      const dx = wx - last.x, dy = wy - last.y;
+      const dist = Math.hypot(dx, dy);
+      // 45° sector bucketing: a component counts only past cos(67.5°) ≈ 0.3827
+      const sx = Math.abs(dx) > dist * 0.3827 ? Math.sign(dx) : 0;
+      const sy = Math.abs(dy) > dist * 0.3827 ? Math.sign(dy) : 0;
+      if (!sx && !sy) break;
+      const stepLen = spacing * Math.hypot(sx, sy);
+      if (dist < stepLen * 0.65) break; // hysteresis: hold this bead until the pen commits
+      const nx = last.x + sx * spacing, ny = last.y + sy * spacing;
+      if (nx < 0 || nx > w || ny < 0 || ny > h) { last = null; break; } // re-seed on re-entry
+      const pos = keyFromPosition(nx, ny);
+      steps.push(pos);
+      last = { x: pos.x, y: pos.y };
+    }
+    lastPaintRef.current = last;
+    if (steps.length === 0) return;
+    // One Map copy for the whole walk (applyDrawTool per step would copy per bead).
+    setDots((prev) => {
+      const next = new Map(prev);
+      for (const s of steps) {
+        if (toolRef.current === "erase") next.delete(s.key);
+        else next.set(s.key, { key: s.key, x: s.x, y: s.y, color: colorRef.current, radius: radiusRef.current });
+      }
+      return next;
+    });
+  }, []);
+
   // ── Touch (finger) navigation: one-finger pan, two-finger pinch-zoom. ──
   // Pen / mouse draw & select; fingers navigate. While a pen is actively
   // drawing, touch points are ignored — palm rejection.
@@ -771,9 +857,14 @@ export function DotArtTool() {
     isPaintingRef.current = true;
     const snap = getNearestSnap(world.x, world.y, CELL_SIZE, snapModeRef.current, canvasBoundsRef.current.w, canvasBoundsRef.current.h);
     if (snap) { setPreview({ x: snap.x, y: snap.y }); applyDrawTool(snap.key, snap.x, snap.y); }
+    lastPaintRef.current = snap ? { x: snap.x, y: snap.y } : null;
   }, [getSVGPoint, applyDrawTool, pushUndo, pushRecentColor, handleTouchNav]);
 
   const handleDoubleClick = useCallback((e: React.MouseEvent) => {
+    // Select-same-color only makes sense in the select tool. Without this
+    // gate, two quick pen taps while drawing register as a double-click and
+    // surprise-select dots mid-stroke.
+    if (toolRef.current !== "select") return;
     if (e.button !== 0) return;
     const world = getSVGPoint(e);
     if (!world) return;
@@ -819,11 +910,26 @@ export function DotArtTool() {
     }
 
     const snap = getNearestSnap(world.x, world.y, CELL_SIZE, snapModeRef.current, canvasBoundsRef.current.w, canvasBoundsRef.current.h);
-    if (snap) {
-      setPreview({ x: snap.x, y: snap.y });
-      if (isPaintingRef.current) applyDrawTool(snap.key, snap.x, snap.y);
+    if (snap) setPreview({ x: snap.x, y: snap.y });
+
+    if (isPaintingRef.current) {
+      // Walk every coalesced sample (Pencil reports up to 240Hz; Safari folds
+      // them into one event per frame) so curves keep their true shape.
+      const native = e.nativeEvent as PointerEvent;
+      const samples = native.getCoalescedEvents?.() ?? [];
+      for (const ev of samples.length ? samples : [native]) {
+        const pt = getSVGPoint(ev as unknown as React.MouseEvent);
+        if (!pt) continue;
+        if (lastPaintRef.current) {
+          paintStrokeTo(pt.x, pt.y);
+        } else {
+          // (Re-)seed: stroke start, or pen re-entering the canvas bounds.
+          const s = getNearestSnap(pt.x, pt.y, CELL_SIZE, snapModeRef.current, canvasBoundsRef.current.w, canvasBoundsRef.current.h);
+          if (s) { applyDrawTool(s.key, s.x, s.y); lastPaintRef.current = { x: s.x, y: s.y }; }
+        }
+      }
     }
-  }, [getSVGPoint, applyDrawTool, handleTouchNav]);
+  }, [getSVGPoint, applyDrawTool, paintStrokeTo, handleTouchNav]);
 
   const handlePointerUp = useCallback((e: React.PointerEvent) => {
     if (e.pointerType === "touch") {
@@ -871,11 +977,13 @@ export function DotArtTool() {
     }
 
     isPaintingRef.current = false;
+    lastPaintRef.current = null;
   }, []);
 
   const handlePointerLeave = useCallback(() => {
     setPreview(null);
     isPaintingRef.current = false;
+    lastPaintRef.current = null;
     isPanningRef.current = false;
     panStartRef.current = null;
     setIsGrabbing(false);
@@ -890,6 +998,7 @@ export function DotArtTool() {
     }
     penActiveRef.current = false;
     isPaintingRef.current = false;
+    lastPaintRef.current = null;
     isDraggingDotsRef.current = false;
     isMarqueeingRef.current = false;
     setMarqueeBox(null);
