@@ -505,7 +505,7 @@ export function DotArtTool() {
       ? hslToHex(h, 25 + Math.random() * 35, 8 + Math.random() * 10)
       : hslToHex(h, 8 + Math.random() * 25, 90 + Math.random() * 7);
     const grid = dark
-      ? hslToHex(h, 15 + Math.random() * 15, 28 + Math.random() * 10)
+      ? hslToHex(h, 15 + Math.random() * 15, 34 + Math.random() * 12)
       : hslToHex(h, 10 + Math.random() * 15, 68 + Math.random() * 10);
     const bh = (h + 90 + Math.random() * 180) % 360;
     const brush = dark
@@ -513,6 +513,9 @@ export function DotArtTool() {
       : hslToHex(bh, 60 + Math.random() * 35, 38 + Math.random() * 14);
     setCanvasBg(bg);
     setGridColor(grid);
+    // The grid's visibility = color contrast × opacity, and an opacity tuned
+    // for a light ground vanishes on a near-black one — shuffle owns both.
+    setGridOpacity(dark ? 0.6 : 0.4);
     setColor(brush);
     pushRecentColor(brush);
     sfx.ui();
