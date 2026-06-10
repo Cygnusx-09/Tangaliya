@@ -271,6 +271,9 @@ export function DotArtTool() {
   const [color, setColor] = useState("#FF2A2A");
   const [recentColors, setRecentColors] = useState<string[]>([]);
   const [radius, setRadius] = useState(3);
+  // Stroke snap reach, % of a lattice step: how far away a point "catches"
+  // the pen during a stroke. High = eager/loose, low = deliberate placement.
+  const [snapReach, setSnapReach] = useState(35);
   const [tool, setTool] = useState<Tool>("draw");
   const [snapMode, setSnapMode] = useState<SnapMode>("both");
   const [preview, setPreview] = useState<{ x: number; y: number } | null>(null);
@@ -364,6 +367,7 @@ export function DotArtTool() {
   const toolRef = useRef<Tool>("draw");
   const colorRef = useRef("#FF2A2A");
   const radiusRef = useRef(3);
+  const snapReachRef = useRef(35);
   const snapModeRef = useRef<SnapMode>("both");
   const canvasBoundsRef = useRef({ w: 0, h: 0 });
   const svgRef = useRef<SVGSVGElement>(null);
@@ -375,6 +379,7 @@ export function DotArtTool() {
   useEffect(() => { toolRef.current = tool; }, [tool]);
   useEffect(() => { colorRef.current = color; }, [color]);
   useEffect(() => { radiusRef.current = radius; }, [radius]);
+  useEffect(() => { snapReachRef.current = snapReach; }, [snapReach]);
   useEffect(() => { snapModeRef.current = snapMode; }, [snapMode]);
 
   const pxPerUnit = CELL_SIZE / cellPhysical;
@@ -716,7 +721,9 @@ export function DotArtTool() {
       const sy = Math.abs(dy) > dist * 0.3827 ? Math.sign(dy) : 0;
       if (!sx && !sy) break;
       const stepLen = spacing * Math.hypot(sx, sy);
-      if (dist < stepLen * 0.65) break; // hysteresis: hold this bead until the pen commits
+      // Hysteresis: hold this bead until the pen is within "snap reach" of the
+      // next point — the user-facing slider sets how eagerly points catch.
+      if (dist < stepLen * (1 - snapReachRef.current / 100)) break;
       const nx = last.x + sx * spacing, ny = last.y + sy * spacing;
       if (nx < 0 || nx > w || ny < 0 || ny > h) { last = null; break; } // re-seed on re-entry
       const pos = keyFromPosition(nx, ny);
@@ -742,6 +749,18 @@ export function DotArtTool() {
   const touchesRef = useRef<Map<number, { x: number; y: number }>>(new Map());
   const gestureRef = useRef<{ dist: number; cx: number; cy: number } | null>(null);
   const penActiveRef = useRef(false);
+
+  // Belt-and-braces for Safari: even with touch-action none, WebKit can hand
+  // a Pencil drag to the scroller and pointercancel the stroke unless native
+  // touchmove is actively prevented (must be a non-passive DOM listener —
+  // React's synthetic handlers can't preventDefault touchmove).
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    const block = (ev: TouchEvent) => ev.preventDefault();
+    el.addEventListener("touchmove", block, { passive: false });
+    return () => el.removeEventListener("touchmove", block);
+  }, []);
 
   const handleTouchNav = useCallback((e: React.PointerEvent, phase: "down" | "move") => {
     const svg = svgRef.current;
@@ -783,6 +802,9 @@ export function DotArtTool() {
   }, []);
 
   const handlePointerDown = useCallback((e: React.PointerEvent) => {
+    // Only strokes that start on the canvas SVG count — the container div
+    // also holds zoom buttons, panel FABs, and the webcam overlay.
+    if (!svgRef.current || !svgRef.current.contains(e.target as Node)) return;
     if (e.pointerType === "touch") {
       if (penActiveRef.current) return; // palm rejection while a pen is drawing
       e.preventDefault();
@@ -865,6 +887,7 @@ export function DotArtTool() {
     // gate, two quick pen taps while drawing register as a double-click and
     // surprise-select dots mid-stroke.
     if (toolRef.current !== "select") return;
+    if (!svgRef.current || !svgRef.current.contains(e.target as Node)) return;
     if (e.button !== 0) return;
     const world = getSVGPoint(e);
     if (!world) return;
@@ -1641,13 +1664,19 @@ export function DotArtTool() {
       </aside>
 
       {/* ── Canvas ── */}
-      <div ref={containerRef} className="flex-1 relative overflow-hidden">
+      {/* Pointer handlers live on this HTML div, NOT the <svg>: WebKit's
+          setPointerCapture is broken on SVG elements, and without capture
+          Safari pointercancels a Pencil drag as a system gesture — strokes
+          died after the first dot on iPad. handlePointerDown gates on the
+          event target so the overlay buttons inside this div never paint. */}
+      <div ref={containerRef} className="flex-1 relative overflow-hidden"
+        style={{ touchAction: "none" }}
+        onPointerDown={handlePointerDown} onPointerMove={handlePointerMove}
+        onPointerUp={handlePointerUp} onPointerLeave={handlePointerLeave}
+        onPointerCancel={handlePointerCancel}
+        onDoubleClick={handleDoubleClick}>
         <svg ref={svgRef} width={viewportSize.width} height={viewportSize.height}
-          className="absolute inset-0 select-none" style={{ cursor, touchAction: "none" }}
-          onPointerDown={handlePointerDown} onPointerMove={handlePointerMove}
-          onPointerUp={handlePointerUp} onPointerLeave={handlePointerLeave}
-          onPointerCancel={handlePointerCancel}
-          onDoubleClick={handleDoubleClick}>
+          className="absolute inset-0 select-none" style={{ cursor }}>
 
           <rect width={viewportSize.width} height={viewportSize.height} style={{ fill: "var(--viewport)" }} />
 
@@ -1856,6 +1885,11 @@ export function DotArtTool() {
                 value={colorMixed ? 7 : activeRadius}
                 display={colorMixed ? "—" : `${activeRadius}`}
                 onChange={setActiveRadius} />
+              {!editingSelection && (
+                <ValueSlider label="Snap reach" min={10} max={70} step={5}
+                  value={snapReach} display={`${snapReach}%`}
+                  onChange={setSnapReach} />
+              )}
             </>
           )}
 
@@ -1926,6 +1960,9 @@ export function DotArtTool() {
               <ValueSlider label="Radius" min={1} max={14}
                 value={radius} display={`${radius}`}
                 onChange={setRadius} />
+              <ValueSlider label="Snap reach" min={10} max={70} step={5}
+                value={snapReach} display={`${snapReach}%`}
+                onChange={setSnapReach} />
               <p className="text-[13px] text-[var(--txt-3)] leading-relaxed px-1">
                 Click or drag across the canvas to remove dots within the radius.
               </p>
