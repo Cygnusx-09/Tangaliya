@@ -1791,7 +1791,16 @@ export function DotArtTool() {
             })}
 
             {preview && tool === "draw" && (
-              <circle cx={preview.x} cy={preview.y} r={radius} fill={color} opacity={0.4} style={{ pointerEvents: "none" }} />
+              <g style={{ pointerEvents: "none" }}>
+                <circle cx={preview.x} cy={preview.y} r={radius} fill={color} opacity={0.4} />
+                {/* Snap-reach halo: the true catch distance — the next point
+                    grabs the pen when it crosses this ring. Scales live with
+                    the Snap reach slider (and with snap mode's lattice step). */}
+                <circle cx={preview.x} cy={preview.y}
+                  r={(snapMode === "both" ? HALF_CELL : CELL_SIZE) * snapReach / 100}
+                  fill="none" stroke={color} strokeOpacity={0.45}
+                  strokeWidth={1 / zoom} strokeDasharray={`${3 / zoom},${2 / zoom}`} />
+              </g>
             )}
             {preview && tool === "erase" && (
               <circle cx={preview.x} cy={preview.y} r={eraseRadius} fill="none"
