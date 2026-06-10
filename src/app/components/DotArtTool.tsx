@@ -1099,6 +1099,12 @@ export function DotArtTool() {
 
   const handlePointerLeave = useCallback((e: React.PointerEvent) => {
     dbg("l", e.pointerType); // TEMP DEBUG
+    // iPad WebKit fires ghost pointerleave events mid-stroke, with the pen
+    // still in contact and captured — resetting here disarmed painting after
+    // the first dot, so trails never formed. While any press-driven
+    // interaction is live, ignore leave; pointerup/cancel own the real cleanup.
+    if (penActiveRef.current || fingerDrawRef.current !== null || isPaintingRef.current ||
+        isPanningRef.current || isDraggingDotsRef.current || isMarqueeingRef.current) return;
     setPreview(null);
     isPaintingRef.current = false;
     fingerDrawRef.current = null;
