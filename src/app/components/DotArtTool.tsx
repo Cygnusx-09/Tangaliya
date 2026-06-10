@@ -738,13 +738,46 @@ export function DotArtTool() {
   // (hysteresis), so hand wobble can't stutter sideways.
   const lastPaintRef = useRef<{ x: number; y: number } | null>(null);
 
+  // ── Magnetic ruler (Freeform-style straightening) ────────────────────────
+  // The walk above already buckets each step into one of 8 lattice directions;
+  // the ruler watches that history. Hold one direction for RULER_LOCK_STEPS
+  // consecutive steps and the stroke locks onto that ray: the pen position is
+  // projected onto it, so hand wobble can't kink a long straight run. A
+  // deliberate swerve — perpendicular drift past RULER_ESCAPE — breaks the
+  // lock and the walk follows the hand again (and can re-lock on a new
+  // heading). The lock origin is always a painted bead, so the ray passes
+  // exactly through lattice points. `rulerGuide` renders the dashed rail.
+  const RULER_LOCK_STEPS = 3;
+  const RULER_ESCAPE = CELL_SIZE * 1.25;
+  const rulerRef = useRef<{ sx: number; sy: number; run: number; ox: number; oy: number; locked: boolean } | null>(null);
+  const [rulerGuide, setRulerGuide] = useState<{ x1: number; y1: number; x2: number; y2: number } | null>(null);
+
   const paintStrokeTo = useCallback((wx: number, wy: number) => {
     const spacing = snapModeRef.current === "both" ? HALF_CELL : CELL_SIZE;
     const { w, h } = canvasBoundsRef.current;
+
+    // Ruler: while locked, walk toward the pen's projection on the ray, not
+    // the pen itself.
+    let tx = wx, ty = wy;
+    const R = rulerRef.current;
+    if (R?.locked) {
+      const len = Math.hypot(R.sx, R.sy);
+      const ux = R.sx / len, uy = R.sy / len;
+      const perp = Math.abs((wx - R.ox) * uy - (wy - R.oy) * ux);
+      if (perp > RULER_ESCAPE) {
+        R.locked = false; R.run = 0;
+        setRulerGuide(null);
+      } else {
+        const t = Math.max(0, (wx - R.ox) * ux + (wy - R.oy) * uy);
+        tx = R.ox + ux * t; ty = R.oy + uy * t;
+        setRulerGuide({ x1: R.ox, y1: R.oy, x2: R.ox + ux * (t + 2 * CELL_SIZE), y2: R.oy + uy * (t + 2 * CELL_SIZE) });
+      }
+    }
+
     const steps: { key: string; x: number; y: number }[] = [];
     let last = lastPaintRef.current;
     for (let guard = 0; last && guard < 256; guard++) {
-      const dx = wx - last.x, dy = wy - last.y;
+      const dx = tx - last.x, dy = ty - last.y;
       const dist = Math.hypot(dx, dy);
       // 45° sector bucketing: a component counts only past cos(67.5°) ≈ 0.3827
       const sx = Math.abs(dx) > dist * 0.3827 ? Math.sign(dx) : 0;
@@ -755,7 +788,15 @@ export function DotArtTool() {
       // next point — the user-facing slider sets how eagerly points catch.
       if (dist < stepLen * (1 - snapReachRef.current / 100)) break;
       const nx = last.x + sx * spacing, ny = last.y + sy * spacing;
-      if (nx < 0 || nx > w || ny < 0 || ny > h) { last = null; break; } // re-seed on re-entry
+      if (nx < 0 || nx > w || ny < 0 || ny > h) { last = null; rulerRef.current = null; setRulerGuide(null); break; } // re-seed on re-entry
+      // Ruler bookkeeping: extend the current same-direction run or start a
+      // new one anchored at the bead this step departs from.
+      const r = rulerRef.current;
+      if (r && r.sx === sx && r.sy === sy) {
+        if (++r.run >= RULER_LOCK_STEPS) r.locked = true;
+      } else {
+        rulerRef.current = { sx, sy, run: 1, ox: last.x, oy: last.y, locked: false };
+      }
       const pos = keyFromPosition(nx, ny);
       steps.push(pos);
       last = { x: pos.x, y: pos.y };
@@ -841,6 +882,8 @@ export function DotArtTool() {
           fingerDrawRef.current = null;
           isPaintingRef.current = false;
           lastPaintRef.current = null;
+          rulerRef.current = null;
+          setRulerGuide(null);
           eraseStrokeRef.current = null;
           isDraggingDotsRef.current = false;
           isMarqueeingRef.current = false;
@@ -930,6 +973,8 @@ export function DotArtTool() {
     const snap = getNearestSnap(world.x, world.y, CELL_SIZE, snapModeRef.current, canvasBoundsRef.current.w, canvasBoundsRef.current.h);
     if (snap) { setPreview({ x: snap.x, y: snap.y }); applyDrawTool(snap.key, snap.x, snap.y); }
     lastPaintRef.current = snap ? { x: snap.x, y: snap.y } : null;
+    rulerRef.current = null;
+    setRulerGuide(null);
   }, [getSVGPoint, applyDrawTool, eraseAlong, pushUndo, pushRecentColor, handleTouchNav]);
 
   const handleDoubleClick = useCallback((e: React.MouseEvent) => {
@@ -1077,6 +1122,8 @@ export function DotArtTool() {
 
     isPaintingRef.current = false;
     lastPaintRef.current = null;
+    rulerRef.current = null;
+    setRulerGuide(null);
     eraseStrokeRef.current = null;
   }, []);
 
@@ -1091,6 +1138,8 @@ export function DotArtTool() {
     isPaintingRef.current = false;
     fingerDrawRef.current = null;
     lastPaintRef.current = null;
+    rulerRef.current = null;
+    setRulerGuide(null);
     eraseStrokeRef.current = null;
     isPanningRef.current = false;
     panStartRef.current = null;
@@ -1109,6 +1158,8 @@ export function DotArtTool() {
     penActiveRef.current = false;
     isPaintingRef.current = false;
     lastPaintRef.current = null;
+    rulerRef.current = null;
+    setRulerGuide(null);
     eraseStrokeRef.current = null;
     isDraggingDotsRef.current = false;
     isMarqueeingRef.current = false;
@@ -1819,6 +1870,13 @@ export function DotArtTool() {
               );
             })}
 
+            {rulerGuide && tool === "draw" && (
+              /* Magnetic-ruler rail: visible only while the stroke is locked
+                 onto a lattice direction; swerving off it breaks the lock. */
+              <line x1={rulerGuide.x1} y1={rulerGuide.y1} x2={rulerGuide.x2} y2={rulerGuide.y2}
+                stroke={color} strokeOpacity={0.35} strokeWidth={1.5 / zoom}
+                strokeDasharray={`${6 / zoom},${4 / zoom}`} style={{ pointerEvents: "none" }} />
+            )}
             {preview && tool === "draw" && (
               <g style={{ pointerEvents: "none" }}>
                 <circle cx={preview.x} cy={preview.y} r={radius} fill={color} opacity={0.4} />
