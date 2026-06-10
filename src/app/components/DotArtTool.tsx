@@ -1502,10 +1502,10 @@ export function DotArtTool() {
   const onPickerChange = (c: string) => { lastPickRef.current = c; editingSelection ? recolorSelectionLive(c) : setColor(c); };
 
   return (
-    <div className={`dotart${dark ? " dark" : ""}${theming ? " theming" : ""} flex h-screen w-screen overflow-hidden bg-[var(--app-bg)] text-[var(--app-fg)]`}>
+    <div className={`dotart${dark ? " dark" : ""}${theming ? " theming" : ""} flex h-dvh w-screen overflow-hidden bg-[var(--app-bg)] text-[var(--app-fg)]`}>
 
       {/* ── Left panel — tools & controls ── */}
-      <aside className={`${compact ? `fixed left-0 top-0 z-50 bg-[var(--app-bg)] shadow-2xl transition-transform duration-300 ${leftOpen ? "translate-x-0" : "-translate-x-full"}` : "relative"} w-[300px] max-w-[88vw] shrink-0 h-screen p-4 flex flex-col gap-4 overflow-hidden`}>
+      <aside className={`${compact ? `fixed left-0 top-0 z-50 bg-[var(--app-bg)] shadow-2xl transition-transform duration-300 ${leftOpen ? "translate-x-0" : "-translate-x-full"}` : "relative"} w-[300px] max-w-[88vw] shrink-0 h-dvh p-4 flex flex-col gap-4 overflow-hidden`}>
 
         {/* Brand header */}
         <div className="bg-[var(--card)] rounded-3xl px-5 py-3.5 flex items-center gap-3 shrink-0">
@@ -1923,7 +1923,7 @@ export function DotArtTool() {
       </div>
 
       {/* ── Right panel — context inspector for the selected element ── */}
-      <aside className={`${compact ? `fixed right-0 top-0 z-50 bg-[var(--app-bg)] shadow-2xl transition-transform duration-300 ${rightOpen ? "translate-x-0" : "translate-x-full"}` : "relative"} w-[300px] max-w-[88vw] shrink-0 h-screen p-4 flex flex-col gap-4 overflow-hidden`}>
+      <aside className={`${compact ? `fixed right-0 top-0 z-50 bg-[var(--app-bg)] shadow-2xl transition-transform duration-300 ${rightOpen ? "translate-x-0" : "translate-x-full"}` : "relative"} w-[300px] max-w-[88vw] shrink-0 h-dvh p-4 flex flex-col gap-4 overflow-hidden`}>
         <div className="bg-[var(--card)] rounded-3xl p-4 flex-1 overflow-y-auto flex flex-col gap-4" style={{ scrollbarWidth: "none" }}>
 
           <div className="flex items-center justify-between">
