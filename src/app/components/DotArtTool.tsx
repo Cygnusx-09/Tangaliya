@@ -853,10 +853,11 @@ export function DotArtTool() {
     });
   }, []);
 
-  // ── Touch (finger) input: one finger draws like the pen, two fingers ──
-  // pan + pinch-zoom together. While a pen is actively drawing, touch
-  // points are ignored — palm rejection. A second finger landing mid-stroke
-  // abandons the one-finger stroke and switches to navigation.
+  // ── Touch (finger) input: one finger pans, two fingers pan + pinch-zoom ──
+  // together. While a pen is actively drawing, touch points are ignored —
+  // palm rejection. Flip FINGER_DRAWS to let a single finger draw like the
+  // pen instead (a 2nd finger landing mid-stroke then converts to navigation).
+  const FINGER_DRAWS = false;
   const touchesRef = useRef<Map<number, { x: number; y: number }>>(new Map());
   const gestureRef = useRef<{ dist: number; cx: number; cy: number } | null>(null);
   const penActiveRef = useRef(false);
@@ -882,9 +883,17 @@ export function DotArtTool() {
       gestureRef.current = null; // re-seed when a 2nd finger starts moving
       return;
     }
-    if (!touchesRef.current.has(e.pointerId)) return;
+    const prev = touchesRef.current.get(e.pointerId);
+    if (!prev) return;
     touchesRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
     const pts = [...touchesRef.current.values()];
+    if (pts.length === 1) {
+      // one-finger drag-pan (only when fingers don't draw)
+      if (FINGER_DRAWS) return;
+      const newPan = { x: panRef.current.x + (e.clientX - prev.x), y: panRef.current.y + (e.clientY - prev.y) };
+      panRef.current = newPan; setPan({ ...newPan });
+      return;
+    }
     if (pts.length >= 2) {
       // two-finger pinch-zoom (anchored at the centroid) + drag-pan
       const [a, b] = pts;
@@ -930,6 +939,7 @@ export function DotArtTool() {
         }
         return;
       }
+      if (!FINGER_DRAWS) return; // single finger navigates only (pan via handleTouchNav)
       // single finger: fall through and draw exactly like the pen
       fingerDrawRef.current = e.pointerId;
     }
@@ -1172,7 +1182,7 @@ export function DotArtTool() {
     // the first dot, so trails never formed. While any press-driven
     // interaction is live, ignore leave; pointerup/cancel own the real cleanup.
     if (penActiveRef.current || fingerDrawRef.current !== null || isPaintingRef.current ||
-        isPanningRef.current || isDraggingDotsRef.current || isMarqueeingRef.current) return;
+      isPanningRef.current || isDraggingDotsRef.current || isMarqueeingRef.current) return;
     setPreview(null);
     isPaintingRef.current = false;
     fingerDrawRef.current = null;
@@ -1654,9 +1664,8 @@ export function DotArtTool() {
                     if (t === "draw") setInspect("dot");
                     if (t !== "select") { setSelectedKeys(new Set()); selectedKeysRef.current = new Set(); }
                   }}
-                  className={`aspect-square rounded-xl flex items-center justify-center transition-all ${
-                    tool === t ? "bg-[var(--solid)] text-[var(--solid-fg)]" : "bg-[var(--ctl)] text-[var(--txt-1)] hover:bg-[var(--ctl-hover)]"
-                  }`}>
+                  className={`aspect-square rounded-xl flex items-center justify-center transition-all ${tool === t ? "bg-[var(--solid)] text-[var(--solid-fg)]" : "bg-[var(--ctl)] text-[var(--txt-1)] hover:bg-[var(--ctl-hover)]"
+                    }`}>
                   {icon}
                 </button>
               ))}
@@ -1678,17 +1687,16 @@ export function DotArtTool() {
             <div className="text-[14px] text-[var(--txt-2)] tracking-[-0.3px] mb-2">Hand Draw</div>
             <button onClick={toggleHandMode}
               title="Draw with your hand via webcam — hover your index fingertip over a snap point to place a dot"
-              className={`w-full flex items-center gap-3 rounded-xl px-3 py-2.5 transition-all ${
-                handMode ? "bg-[var(--solid)] text-[var(--solid-fg)]" : "bg-[var(--ctl)] text-[var(--txt-1)] hover:bg-[var(--ctl-hover)]"
-              }`}>
+              className={`w-full flex items-center gap-3 rounded-xl px-3 py-2.5 transition-all ${handMode ? "bg-[var(--solid)] text-[var(--solid-fg)]" : "bg-[var(--ctl)] text-[var(--txt-1)] hover:bg-[var(--ctl-hover)]"
+                }`}>
               <Hand size={18} className="shrink-0" />
               <span className="flex flex-col items-start leading-tight min-w-0">
                 <span className="text-[14px]">{handMode ? "Hand draw on" : "Hand draw off"}</span>
                 <span className={`text-[11px] ${handMode ? "opacity-80" : "text-[var(--txt-3)]"}`}>
                   {handStatus === "loading" ? "Starting camera…"
                     : handStatus === "ready" ? "Aim fingertip at a dot"
-                    : handStatus === "error" ? "Camera unavailable"
-                    : "Webcam · MediaPipe"}
+                      : handStatus === "error" ? "Camera unavailable"
+                        : "Webcam · MediaPipe"}
                 </span>
               </span>
             </button>
@@ -1700,9 +1708,8 @@ export function DotArtTool() {
             <div className="flex gap-2">
               {(["mm", "cm", "in"] as Unit[]).map((u) => (
                 <button key={u} onClick={() => changeUnit(u)}
-                  className={`flex-1 py-2 rounded-xl text-[16px] transition-all ${
-                    unit === u ? "bg-[var(--solid)] text-[var(--solid-fg)]" : "bg-[var(--ctl)] text-[var(--txt-1)] hover:bg-[var(--ctl-hover)]"
-                  }`}>
+                  className={`flex-1 py-2 rounded-xl text-[16px] transition-all ${unit === u ? "bg-[var(--solid)] text-[var(--solid-fg)]" : "bg-[var(--ctl)] text-[var(--txt-1)] hover:bg-[var(--ctl-hover)]"
+                    }`}>
                   {u}
                 </button>
               ))}
@@ -1781,9 +1788,8 @@ export function DotArtTool() {
                 { value: "center" as SnapMode, label: "Center" },
               ]).map(({ value, label }) => (
                 <button key={value} onClick={() => { setSnapMode(value); sfx.ui(); }}
-                  className={`flex-1 py-2 rounded-xl text-[13px] transition-all ${
-                    snapMode === value ? "bg-[var(--solid)] text-[var(--solid-fg)]" : "bg-[var(--ctl)] text-[var(--txt-1)] hover:bg-[var(--ctl-hover)]"
-                  }`}>
+                  className={`flex-1 py-2 rounded-xl text-[13px] transition-all ${snapMode === value ? "bg-[var(--solid)] text-[var(--solid-fg)]" : "bg-[var(--ctl)] text-[var(--txt-1)] hover:bg-[var(--ctl-hover)]"
+                    }`}>
                   {label}
                 </button>
               ))}
@@ -1802,9 +1808,8 @@ export function DotArtTool() {
                 const active = inspect === key && !(tool === "erase") && !(tool === "select" && selectedKeys.size > 0);
                 return (
                   <button key={key} onClick={() => setInspect(key)}
-                    className={`flex items-center gap-3 rounded-xl px-3 py-2.5 transition-all ${
-                      active ? "bg-[var(--card-active)] ring-2 ring-[var(--solid)]/80" : "bg-[var(--ctl)] hover:bg-[var(--ctl-hover)]"
-                    }`}>
+                    className={`flex items-center gap-3 rounded-xl px-3 py-2.5 transition-all ${active ? "bg-[var(--card-active)] ring-2 ring-[var(--solid)]/80" : "bg-[var(--ctl)] hover:bg-[var(--ctl-hover)]"
+                      }`}>
                     <span className="text-[var(--txt-2)]">{icon}</span>
                     <span className="w-6 h-6 rounded-md shrink-0" style={{ backgroundColor: swatch, border: "1px solid rgba(0,0,0,0.1)" }} />
                     <span className="flex flex-col items-start leading-tight min-w-0">
@@ -2146,9 +2151,8 @@ export function DotArtTool() {
                   ]).map(({ hex, grid, label }) => (
                     <button key={hex}
                       onClick={() => { setCanvasBg(hex); setGridColor(grid); }}
-                      className={`rounded-xl h-16 flex items-end justify-start p-2 transition-all ${
-                        canvasBg.toLowerCase() === hex ? "ring-2 ring-[var(--solid)]/80" : ""
-                      }`}
+                      className={`rounded-xl h-16 flex items-end justify-start p-2 transition-all ${canvasBg.toLowerCase() === hex ? "ring-2 ring-[var(--solid)]/80" : ""
+                        }`}
                       style={{ backgroundColor: hex, border: "1px solid rgba(0,0,0,0.1)" }}>
                       <span className={`text-[13px] ${hex === "#000000" ? "text-white" : "text-[var(--txt-1)]"}`}>{label}</span>
                     </button>
