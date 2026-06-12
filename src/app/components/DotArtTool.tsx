@@ -353,6 +353,9 @@ export function DotArtTool() {
 
   const [zoom, setZoom] = useState(1);
   const [pan, setPan] = useState({ x: 0, y: 0 });
+  // Canvas view rotation in radians (two-finger twist, like Procreate).
+  // View-only — world coordinates, snapping, and exports are unaffected.
+  const [rot, setRot] = useState(0);
   const [isGrabbing, setIsGrabbing] = useState(false);
   // Hold-to-clear: press and hold the Clear button for HOLD_CLEAR_MS to wipe the canvas.
   const [clearProgress, setClearProgress] = useState(0); // 0–100, drives the fill bar
@@ -368,6 +371,7 @@ export function DotArtTool() {
 
   const zoomRef = useRef(1);
   const panRef = useRef({ x: 0, y: 0 });
+  const rotRef = useRef(0);
   const dotsRef = useRef<Map<string, Dot>>(new Map());
   const undoStackRef = useRef<Map<string, Dot>[]>([]);
   const redoStackRef = useRef<Map<string, Dot>[]>([]);
@@ -450,6 +454,7 @@ export function DotArtTool() {
     const newZoom = Math.min(Math.max(z, MIN_ZOOM), MAX_ZOOM);
     const px = (viewportSize.width - canvasPxW * newZoom) / 2;
     const py = (viewportSize.height - canvasPxH * newZoom) / 2;
+    rotRef.current = 0; setRot(0); // fit also straightens a rotated view
     applyViewport(newZoom, { x: px, y: py });
   }, [viewportSize, canvasPxW, canvasPxH, applyViewport]);
 
@@ -726,10 +731,14 @@ export function DotArtTool() {
     return () => svg.removeEventListener("wheel", handler);
   }, []);
 
-  const screenToWorld = (sx: number, sy: number) => ({
-    x: (sx - panRef.current.x) / zoomRef.current,
-    y: (sy - panRef.current.y) / zoomRef.current,
-  });
+  // Inverse of the view transform translate(pan) · scale(zoom) · rotate(rot):
+  // world = R(−rot) · (screen − pan) / zoom.
+  const screenToWorld = (sx: number, sy: number) => {
+    const dx = (sx - panRef.current.x) / zoomRef.current;
+    const dy = (sy - panRef.current.y) / zoomRef.current;
+    const c = Math.cos(rotRef.current), s = Math.sin(rotRef.current);
+    return { x: dx * c + dy * s, y: -dx * s + dy * c };
+  };
 
   const getSVGPoint = useCallback((e: React.MouseEvent) => {
     const svg = svgRef.current;
@@ -858,8 +867,9 @@ export function DotArtTool() {
   // palm rejection. Flip FINGER_DRAWS to let a single finger draw like the
   // pen instead (a 2nd finger landing mid-stroke then converts to navigation).
   const FINGER_DRAWS = false;
+  const ROT_SNAP = (5 * Math.PI) / 180; // twist snaps to a quarter turn within 5°
   const touchesRef = useRef<Map<number, { x: number; y: number }>>(new Map());
-  const gestureRef = useRef<{ dist: number; cx: number; cy: number } | null>(null);
+  const gestureRef = useRef<{ dist: number; cx: number; cy: number; angle: number } | null>(null);
   const penActiveRef = useRef(false);
   const fingerDrawRef = useRef<number | null>(null); // pointerId of a finger mid-stroke
 
@@ -895,24 +905,43 @@ export function DotArtTool() {
       return;
     }
     if (pts.length >= 2) {
-      // two-finger pinch-zoom (anchored at the centroid) + drag-pan
+      // two-finger pinch-zoom + twist-rotate + drag-pan, all one gesture
+      // anchored at the centroid: the world point under the fingers' midpoint
+      // stays glued to it through zoom, rotation, and translation together.
       const [a, b] = pts;
       const dist = Math.hypot(a.x - b.x, a.y - b.y);
       const cx = (a.x + b.x) / 2, cy = (a.y + b.y) / 2;
+      const angle = Math.atan2(b.y - a.y, b.x - a.x);
       const g = gestureRef.current;
       if (g && g.dist > 0) {
         const rect = svg.getBoundingClientRect();
         const oldZoom = zoomRef.current;
         const newZoom = Math.min(Math.max(oldZoom * (dist / g.dist), MIN_ZOOM), MAX_ZOOM);
-        const ax = cx - rect.left, ay = cy - rect.top;
+        // Twist delta, wrapped so the atan2 seam can't flip the canvas.
+        let dRot = angle - g.angle;
+        if (dRot > Math.PI) dRot -= 2 * Math.PI;
+        else if (dRot < -Math.PI) dRot += 2 * Math.PI;
+        let newRot = rotRef.current + dRot;
+        if (newRot > Math.PI) newRot -= 2 * Math.PI;
+        else if (newRot < -Math.PI) newRot += 2 * Math.PI;
+        // Soft snap to the nearest quarter turn so "straight" is easy to hit.
+        const quarter = Math.PI / 2;
+        const nearest = Math.round(newRot / quarter) * quarter;
+        if (Math.abs(newRot - nearest) < ROT_SNAP) newRot = nearest;
+        const applied = newRot - rotRef.current;
+        // pan' = c_new − (zoom'/zoom) · R(Δrot) · (c_old − pan)
+        const k = newZoom / oldZoom;
+        const rc = Math.cos(applied), rs = Math.sin(applied);
+        const vx = (g.cx - rect.left) - panRef.current.x;
+        const vy = (g.cy - rect.top) - panRef.current.y;
         const newPan = {
-          x: ax - (ax - panRef.current.x) * (newZoom / oldZoom) + (cx - g.cx),
-          y: ay - (ay - panRef.current.y) * (newZoom / oldZoom) + (cy - g.cy),
+          x: (cx - rect.left) - k * (rc * vx - rs * vy),
+          y: (cy - rect.top) - k * (rs * vx + rc * vy),
         };
-        zoomRef.current = newZoom; panRef.current = newPan;
-        setZoom(newZoom); setPan({ ...newPan });
+        zoomRef.current = newZoom; panRef.current = newPan; rotRef.current = newRot;
+        setZoom(newZoom); setPan({ ...newPan }); setRot(newRot);
       }
-      gestureRef.current = { dist, cx, cy };
+      gestureRef.current = { dist, cx, cy, angle };
     }
   }, []);
 
@@ -1670,16 +1699,6 @@ export function DotArtTool() {
                 </button>
               ))}
             </div>
-            <div className="flex gap-2 mt-2">
-              <button onClick={undo} disabled={undoCount === 0} title="Undo (Ctrl+Z)"
-                className="flex-1 flex items-center justify-center gap-1.5 py-2 rounded-xl bg-[var(--ctl)] text-[var(--txt-1)] text-[13px] hover:bg-[var(--ctl-hover)] disabled:opacity-30 disabled:cursor-not-allowed transition-all">
-                <Undo2 size={15} /> Undo
-              </button>
-              <button onClick={redo} disabled={redoCount === 0} title="Redo (Ctrl+Shift+Z)"
-                className="flex-1 flex items-center justify-center gap-1.5 py-2 rounded-xl bg-[var(--ctl)] text-[var(--txt-1)] text-[13px] hover:bg-[var(--ctl-hover)] disabled:opacity-30 disabled:cursor-not-allowed transition-all">
-                <Redo2 size={15} /> Redo
-              </button>
-            </div>
           </div>
 
           {/* Hand Draw (webcam) */}
@@ -1874,7 +1893,7 @@ export function DotArtTool() {
 
           <rect width={viewportSize.width} height={viewportSize.height} style={{ fill: "var(--viewport)" }} />
 
-          <g transform={`translate(${pan.x},${pan.y}) scale(${zoom})`}>
+          <g transform={`translate(${pan.x},${pan.y}) scale(${zoom}) rotate(${(rot * 180) / Math.PI})`}>
             <rect x={6 / zoom} y={8 / zoom} width={canvasPxW} height={canvasPxH} fill="#000" opacity={0.12} />
             <rect x={0} y={0} width={canvasPxW} height={canvasPxH} fill={canvasBg} />
 
@@ -1975,6 +1994,21 @@ export function DotArtTool() {
           <span className="text-[var(--overlay-fg)]">{dots.size} dot{dots.size !== 1 ? "s" : ""}</span>
         </div>
 
+        {/* Undo / redo cluster (bottom-center) — floats on the canvas so it's
+            one tap on iPad without opening the tools panel; targets are kept
+            big (48px tall, wide pads) so a finger can't miss mid-flow. */}
+        <div className="absolute bottom-4 left-1/2 -translate-x-1/2 flex items-center gap-0.5 bg-[var(--overlay)] border border-[var(--overlay-border)] rounded-xl shadow-sm px-1 py-1">
+          <button onClick={undo} disabled={undoCount === 0} title="Undo (Ctrl+Z)" aria-label="Undo"
+            className="h-12 px-5 flex items-center justify-center gap-2 rounded-lg hover:bg-[var(--ctl-hover)] text-[var(--overlay-fg)] text-[13px] disabled:opacity-30 disabled:cursor-not-allowed transition-colors select-none touch-none">
+            <Undo2 size={19} /> Undo
+          </button>
+          <div className="w-px h-5 bg-[var(--overlay-border)] mx-0.5" />
+          <button onClick={redo} disabled={redoCount === 0} title="Redo (Ctrl+Shift+Z)" aria-label="Redo"
+            className="h-12 px-5 flex items-center justify-center gap-2 rounded-lg hover:bg-[var(--ctl-hover)] text-[var(--overlay-fg)] text-[13px] disabled:opacity-30 disabled:cursor-not-allowed transition-colors select-none touch-none">
+            Redo <Redo2 size={19} />
+          </button>
+        </div>
+
         {/* Zoom cluster (bottom-right) */}
         <div className="absolute bottom-4 right-4 flex items-center gap-0.5 bg-[var(--overlay)] border border-[var(--overlay-border)] rounded-lg shadow-sm px-1 py-1">
           <button onClick={() => zoomTo(zoom / 1.3)} className="w-7 h-7 flex items-center justify-center rounded hover:bg-[var(--ctl-hover)] text-[var(--overlay-fg-muted)] transition-colors"><ZoomOut size={13} /></button>
@@ -1991,7 +2025,7 @@ export function DotArtTool() {
         )}
 
         {/* Compact: floating buttons to reveal the tool / properties panels.
-            Pen draws · one finger pans · two fingers pinch-zoom. */}
+            Pen draws · one finger pans · two fingers pinch-zoom + rotate. */}
         {compact && (
           <>
             <button onClick={() => { setLeftOpen((v) => !v); setRightOpen(false); }} aria-label="Tools panel"
