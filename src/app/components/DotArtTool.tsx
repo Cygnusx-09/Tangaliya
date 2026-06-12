@@ -799,6 +799,22 @@ export function DotArtTool() {
   const RULER_ESCAPE = CELL_SIZE * 1.25;
   const rulerRef = useRef<{ sx: number; sy: number; run: number; ox: number; oy: number; locked: boolean } | null>(null);
   const [rulerGuide, setRulerGuide] = useState<{ x1: number; y1: number; x2: number; y2: number } | null>(null);
+  // User toggle: straightening helps long straight runs but fights deliberate
+  // curves, so it's switchable from the floating cluster (persisted).
+  const [rulerOn, setRulerOn] = useState<boolean>(() => {
+    try { return localStorage.getItem("tangaliya-ruler") !== "0"; } catch { return true; }
+  });
+  const rulerOnRef = useRef(rulerOn);
+  useEffect(() => {
+    rulerOnRef.current = rulerOn;
+    try { localStorage.setItem("tangaliya-ruler", rulerOn ? "1" : "0"); } catch { /* ignore */ }
+  }, [rulerOn]);
+  const toggleRuler = useCallback(() => {
+    setRulerOn((v) => !v);
+    rulerRef.current = null; // drop any live lock either way
+    setRulerGuide(null);
+    sfx.toggle();
+  }, []);
 
   const paintStrokeTo = useCallback((wx: number, wy: number) => {
     const spacing = snapModeRef.current === "both" ? HALF_CELL : CELL_SIZE;
@@ -839,11 +855,13 @@ export function DotArtTool() {
       if (nx < 0 || nx > w || ny < 0 || ny > h) { last = null; rulerRef.current = null; setRulerGuide(null); break; } // re-seed on re-entry
       // Ruler bookkeeping: extend the current same-direction run or start a
       // new one anchored at the bead this step departs from.
-      const r = rulerRef.current;
-      if (r && r.sx === sx && r.sy === sy) {
-        if (++r.run >= RULER_LOCK_STEPS) r.locked = true;
-      } else {
-        rulerRef.current = { sx, sy, run: 1, ox: last.x, oy: last.y, locked: false };
+      if (rulerOnRef.current) {
+        const r = rulerRef.current;
+        if (r && r.sx === sx && r.sy === sy) {
+          if (++r.run >= RULER_LOCK_STEPS) r.locked = true;
+        } else {
+          rulerRef.current = { sx, sy, run: 1, ox: last.x, oy: last.y, locked: false };
+        }
       }
       const pos = keyFromPosition(nx, ny);
       steps.push(pos);
@@ -870,6 +888,10 @@ export function DotArtTool() {
   const ROT_SNAP = (5 * Math.PI) / 180; // twist snaps to a quarter turn within 5°
   const touchesRef = useRef<Map<number, { x: number; y: number }>>(new Map());
   const gestureRef = useRef<{ dist: number; cx: number; cy: number; angle: number } | null>(null);
+  // Unsnapped twist accumulator. Snapping must be display-only: if the snapped
+  // value were stored back, every per-frame delta inside the 5° zone would be
+  // re-zeroed and a slow twist could never escape it (rotation felt "stuck").
+  const rotRawRef = useRef(0);
   const penActiveRef = useRef(false);
   const fingerDrawRef = useRef<number | null>(null); // pointerId of a finger mid-stroke
 
@@ -921,13 +943,15 @@ export function DotArtTool() {
         let dRot = angle - g.angle;
         if (dRot > Math.PI) dRot -= 2 * Math.PI;
         else if (dRot < -Math.PI) dRot += 2 * Math.PI;
-        let newRot = rotRef.current + dRot;
-        if (newRot > Math.PI) newRot -= 2 * Math.PI;
-        else if (newRot < -Math.PI) newRot += 2 * Math.PI;
-        // Soft snap to the nearest quarter turn so "straight" is easy to hit.
+        let raw = rotRawRef.current + dRot;
+        if (raw > Math.PI) raw -= 2 * Math.PI;
+        else if (raw < -Math.PI) raw += 2 * Math.PI;
+        rotRawRef.current = raw;
+        // Soft snap to the nearest quarter turn so "straight" is easy to hit —
+        // applied to the displayed angle only; `raw` keeps the true twist.
         const quarter = Math.PI / 2;
-        const nearest = Math.round(newRot / quarter) * quarter;
-        if (Math.abs(newRot - nearest) < ROT_SNAP) newRot = nearest;
+        const nearest = Math.round(raw / quarter) * quarter;
+        const newRot = Math.abs(raw - nearest) < ROT_SNAP ? nearest : raw;
         const applied = newRot - rotRef.current;
         // pan' = c_new − (zoom'/zoom) · R(Δrot) · (c_old − pan)
         const k = newZoom / oldZoom;
@@ -940,6 +964,9 @@ export function DotArtTool() {
         };
         zoomRef.current = newZoom; panRef.current = newPan; rotRef.current = newRot;
         setZoom(newZoom); setPan({ ...newPan }); setRot(newRot);
+      } else {
+        // gesture (re)starts: seed the accumulator from the settled angle
+        rotRawRef.current = rotRef.current;
       }
       gestureRef.current = { dist, cx, cy, angle };
     }
@@ -2006,6 +2033,12 @@ export function DotArtTool() {
           <button onClick={redo} disabled={redoCount === 0} title="Redo (Ctrl+Shift+Z)" aria-label="Redo"
             className="h-12 px-5 flex items-center justify-center gap-2 rounded-lg hover:bg-[var(--ctl-hover)] text-[var(--overlay-fg)] text-[13px] disabled:opacity-30 disabled:cursor-not-allowed transition-colors select-none touch-none">
             Redo <Redo2 size={19} />
+          </button>
+          <div className="w-px h-5 bg-[var(--overlay-border)] mx-0.5" />
+          <button onClick={toggleRuler} aria-pressed={rulerOn} aria-label="Toggle magnetic ruler"
+            title={rulerOn ? "Magnetic ruler on — strokes straighten onto a line (tap to turn off for curves)" : "Magnetic ruler off — strokes follow the hand freely"}
+            className={`h-12 px-4 flex items-center justify-center rounded-lg text-[13px] transition-colors select-none touch-none ${rulerOn ? "bg-[var(--solid)] text-[var(--solid-fg)]" : "text-[var(--overlay-fg)] hover:bg-[var(--ctl-hover)]"}`}>
+            <Ruler size={19} />
           </button>
         </div>
 
