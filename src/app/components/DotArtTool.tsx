@@ -886,6 +886,12 @@ export function DotArtTool() {
   // pen instead (a 2nd finger landing mid-stroke then converts to navigation).
   const FINGER_DRAWS = false;
   const ROT_SNAP = (5 * Math.PI) / 180; // twist snaps to a quarter turn within 5°
+  // Multi-finger taps (Procreate-style): two-finger tap = undo, three = redo.
+  // A tap = every finger down and up within TAP_MS, none drifting past
+  // TAP_SLOP px — so a real pan/pinch/twist can never misfire as one.
+  const TAP_MS = 300;
+  const TAP_SLOP = 12;
+  const tapRef = useRef<{ start: number; maxCount: number; moved: boolean; downs: Map<number, { x: number; y: number }> } | null>(null);
   const touchesRef = useRef<Map<number, { x: number; y: number }>>(new Map());
   const gestureRef = useRef<{ dist: number; cx: number; cy: number; angle: number } | null>(null);
   // Unsnapped twist accumulator. Snapping must be display-only: if the snapped
@@ -902,7 +908,13 @@ export function DotArtTool() {
   useEffect(() => {
     const el = containerRef.current;
     if (!el) return;
-    const block = (ev: TouchEvent) => ev.preventDefault();
+    // Only block moves that started on the canvas SVG (touch events keep
+    // targeting their start element). A blanket preventDefault also killed
+    // click synthesis on the overlay buttons — a Pencil tap always wobbles a
+    // pixel, fires touchmove, and Safari then swallows the button's click.
+    const block = (ev: TouchEvent) => {
+      if (svgRef.current?.contains(ev.target as Node)) ev.preventDefault();
+    };
     el.addEventListener("touchmove", block, { passive: false });
     return () => el.removeEventListener("touchmove", block);
   }, []);
@@ -980,6 +992,13 @@ export function DotArtTool() {
       if (penActiveRef.current) return; // palm rejection while a pen is drawing
       e.preventDefault();
       handleTouchNav(e, "down");
+      // Arm/extend a multi-finger tap candidate (resolved on the last finger up).
+      if (touchesRef.current.size === 1) {
+        tapRef.current = { start: performance.now(), maxCount: 1, moved: false, downs: new Map([[e.pointerId, { x: e.clientX, y: e.clientY }]]) };
+      } else if (tapRef.current) {
+        tapRef.current.maxCount = Math.max(tapRef.current.maxCount, touchesRef.current.size);
+        tapRef.current.downs.set(e.pointerId, { x: e.clientX, y: e.clientY });
+      }
       if (touchesRef.current.size >= 2) {
         // 2nd finger lands: abandon any one-finger stroke, become a gesture
         if (fingerDrawRef.current !== null) {
@@ -1098,6 +1117,11 @@ export function DotArtTool() {
   const handlePointerMove = useCallback((e: React.PointerEvent) => {
     if (e.pointerType === "touch") {
       if (penActiveRef.current) return;
+      const t = tapRef.current;
+      if (t && !t.moved) {
+        const d0 = t.downs.get(e.pointerId);
+        if (d0 && Math.hypot(e.clientX - d0.x, e.clientY - d0.y) > TAP_SLOP) t.moved = true;
+      }
       if (fingerDrawRef.current === e.pointerId && touchesRef.current.size === 1) {
         // keep the nav position fresh so a 2nd finger can take over cleanly
         touchesRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
@@ -1182,6 +1206,15 @@ export function DotArtTool() {
     if (e.pointerType === "touch") {
       touchesRef.current.delete(e.pointerId);
       if (touchesRef.current.size < 2) gestureRef.current = null;
+      // Last finger up resolves a pending multi-finger tap: undo / redo.
+      if (touchesRef.current.size === 0) {
+        const t = tapRef.current;
+        tapRef.current = null;
+        if (t && !t.moved && performance.now() - t.start <= TAP_MS) {
+          if (t.maxCount === 2) undo();
+          else if (t.maxCount === 3) redo();
+        }
+      }
       if (fingerDrawRef.current !== e.pointerId) return;
       fingerDrawRef.current = null;
       // fall through: finish the finger stroke exactly like the pen
@@ -1230,7 +1263,7 @@ export function DotArtTool() {
     rulerRef.current = null;
     setRulerGuide(null);
     eraseStrokeRef.current = null;
-  }, []);
+  }, [undo, redo]);
 
   const handlePointerLeave = useCallback(() => {
     // iPad WebKit fires ghost pointerleave events mid-stroke, with the pen
@@ -1256,6 +1289,7 @@ export function DotArtTool() {
     if (e.pointerType === "touch") {
       touchesRef.current.delete(e.pointerId);
       if (touchesRef.current.size < 2) gestureRef.current = null;
+      tapRef.current = null; // a cancelled touch can't be a tap
       if (fingerDrawRef.current !== e.pointerId) return;
       fingerDrawRef.current = null;
       // fall through: reset stroke state like a cancelled pen
