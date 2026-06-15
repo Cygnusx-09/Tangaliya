@@ -18,6 +18,10 @@ interface Dot {
 
 const CELL_SIZE = 20;
 const HALF_CELL = CELL_SIZE / 2;
+// Graph-paper minor lines: how many subdivisions per cell (visual only — does
+// NOT affect snapping). 5 = classic geography/engineering paper (5 small
+// squares between bold cell lines).
+const GRID_SUBDIV = 5;
 const MIN_ZOOM = 0.1;
 const MAX_ZOOM = 20;
 const MAX_UNDO = 60;
@@ -162,17 +166,24 @@ function buildSVGString(
 ): string {
   const wPhys = (canvasPxW / pxPerUnit).toFixed(2);
   const hPhys = (canvasPxH / pxPerUnit).toFixed(2);
-  const halfCell = cellSize / 2;
   const cols = Math.round(canvasPxW / cellSize);
   const rows = Math.round(canvasPxH / cellSize);
   const visible = dots.filter((d) => d.x >= -d.radius && d.x <= canvasPxW + d.radius && d.y >= -d.radius && d.y <= canvasPxH + d.radius);
 
-  // Build sub-grid lines (thinner, at half-cell intervals)
+  // Build minor grid lines (graph-paper style): GRID_SUBDIV subdivisions per
+  // cell, skipping positions that land on a bold main line.
+  const sub = cellSize / GRID_SUBDIV;
   const subGridLines: string[] = [];
-  for (let i = 0; i < cols; i++)
-    subGridLines.push(`<line x1="${i * cellSize + halfCell}" y1="0" x2="${i * cellSize + halfCell}" y2="${canvasPxH}" stroke="${gridColor}" stroke-opacity="${gridOpacity * 0.4}" stroke-width="${gridThickness * 0.5}"/>`);
-  for (let i = 0; i < rows; i++)
-    subGridLines.push(`<line x1="0" y1="${i * cellSize + halfCell}" x2="${canvasPxW}" y2="${i * cellSize + halfCell}" stroke="${gridColor}" stroke-opacity="${gridOpacity * 0.4}" stroke-width="${gridThickness * 0.5}"/>`);
+  for (let i = 1; i < cols * GRID_SUBDIV; i++) {
+    if (i % GRID_SUBDIV === 0) continue;
+    const x = i * sub;
+    subGridLines.push(`<line x1="${x}" y1="0" x2="${x}" y2="${canvasPxH}" stroke="${gridColor}" stroke-opacity="${gridOpacity * 0.4}" stroke-width="${gridThickness * 0.5}"/>`);
+  }
+  for (let i = 1; i < rows * GRID_SUBDIV; i++) {
+    if (i % GRID_SUBDIV === 0) continue;
+    const y = i * sub;
+    subGridLines.push(`<line x1="0" y1="${y}" x2="${canvasPxW}" y2="${y}" stroke="${gridColor}" stroke-opacity="${gridOpacity * 0.4}" stroke-width="${gridThickness * 0.5}"/>`);
+  }
 
   // Build main grid lines
   const mainGridLines: string[] = [];
@@ -1958,15 +1969,22 @@ export function DotArtTool() {
             <rect x={6 / zoom} y={8 / zoom} width={canvasPxW} height={canvasPxH} fill="#000" opacity={0.12} />
             <rect x={0} y={0} width={canvasPxW} height={canvasPxH} fill={canvasBg} />
 
-            {/* Sub-grid: thinner lines at half-cell intervals (2×2 per cell) */}
-            {Array.from({ length: cols }, (_, i) => (
-              <line key={`sv${i}`} x1={i * CELL_SIZE + HALF_CELL} y1={0} x2={i * CELL_SIZE + HALF_CELL} y2={canvasPxH}
-                stroke={gridColor} strokeOpacity={gridOpacity * 0.4} strokeWidth={(gridThickness * 0.5) / zoom} />
-            ))}
-            {Array.from({ length: rows }, (_, i) => (
-              <line key={`sh${i}`} x1={0} y1={i * CELL_SIZE + HALF_CELL} x2={canvasPxW} y2={i * CELL_SIZE + HALF_CELL}
-                stroke={gridColor} strokeOpacity={gridOpacity * 0.4} strokeWidth={(gridThickness * 0.5) / zoom} />
-            ))}
+            {/* Minor grid: GRID_SUBDIV subdivisions per cell (graph-paper),
+                skipping lines that coincide with a bold main line */}
+            {Array.from({ length: cols * GRID_SUBDIV - 1 }, (_, idx) => {
+              const i = idx + 1;
+              if (i % GRID_SUBDIV === 0) return null;
+              const x = i * (CELL_SIZE / GRID_SUBDIV);
+              return <line key={`sv${i}`} x1={x} y1={0} x2={x} y2={canvasPxH}
+                stroke={gridColor} strokeOpacity={gridOpacity * 0.4} strokeWidth={(gridThickness * 0.5) / zoom} />;
+            })}
+            {Array.from({ length: rows * GRID_SUBDIV - 1 }, (_, idx) => {
+              const i = idx + 1;
+              if (i % GRID_SUBDIV === 0) return null;
+              const y = i * (CELL_SIZE / GRID_SUBDIV);
+              return <line key={`sh${i}`} x1={0} y1={y} x2={canvasPxW} y2={y}
+                stroke={gridColor} strokeOpacity={gridOpacity * 0.4} strokeWidth={(gridThickness * 0.5) / zoom} />;
+            })}
 
             {/* Main grid lines */}
             {Array.from({ length: cols + 1 }, (_, i) => (
