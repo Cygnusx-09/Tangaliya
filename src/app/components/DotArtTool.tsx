@@ -20,8 +20,8 @@ const CELL_SIZE = 20;
 const HALF_CELL = CELL_SIZE / 2;
 // Graph-paper minor lines: how many subdivisions per cell (visual only — does
 // NOT affect snapping). 5 = classic geography/engineering paper (5 small
-// squares between bold cell lines).
-const GRID_SUBDIV = 5;
+// squares between bold cell lines). 10 = millimeter-paper density.
+const GRID_SUBDIV = 10;
 const MIN_ZOOM = 0.1;
 const MAX_ZOOM = 20;
 const MAX_UNDO = 60;
