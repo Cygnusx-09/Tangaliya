@@ -173,16 +173,19 @@ function buildSVGString(
   // Build minor grid lines (graph-paper style): GRID_SUBDIV subdivisions per
   // cell, skipping positions that land on a bold main line.
   const sub = cellSize / GRID_SUBDIV;
+  const mid = GRID_SUBDIV / 2; // half-cell line — carries the center/edge snap points
   const subGridLines: string[] = [];
   for (let i = 1; i < cols * GRID_SUBDIV; i++) {
     if (i % GRID_SUBDIV === 0) continue;
+    const isMid = i % GRID_SUBDIV === mid;
     const x = i * sub;
-    subGridLines.push(`<line x1="${x}" y1="0" x2="${x}" y2="${canvasPxH}" stroke="${gridColor}" stroke-opacity="${gridOpacity * 0.4}" stroke-width="${gridThickness * 0.5}"/>`);
+    subGridLines.push(`<line x1="${x}" y1="0" x2="${x}" y2="${canvasPxH}" stroke="${gridColor}" stroke-opacity="${gridOpacity * (isMid ? 0.55 : 0.4)}" stroke-width="${gridThickness * (isMid ? 0.65 : 0.5)}"/>`);
   }
   for (let i = 1; i < rows * GRID_SUBDIV; i++) {
     if (i % GRID_SUBDIV === 0) continue;
+    const isMid = i % GRID_SUBDIV === mid;
     const y = i * sub;
-    subGridLines.push(`<line x1="0" y1="${y}" x2="${canvasPxW}" y2="${y}" stroke="${gridColor}" stroke-opacity="${gridOpacity * 0.4}" stroke-width="${gridThickness * 0.5}"/>`);
+    subGridLines.push(`<line x1="0" y1="${y}" x2="${canvasPxW}" y2="${y}" stroke="${gridColor}" stroke-opacity="${gridOpacity * (isMid ? 0.55 : 0.4)}" stroke-width="${gridThickness * (isMid ? 0.65 : 0.5)}"/>`);
   }
 
   // Build main grid lines
@@ -1974,16 +1977,18 @@ export function DotArtTool() {
             {Array.from({ length: cols * GRID_SUBDIV - 1 }, (_, idx) => {
               const i = idx + 1;
               if (i % GRID_SUBDIV === 0) return null;
+              const isMid = i % GRID_SUBDIV === GRID_SUBDIV / 2;
               const x = i * (CELL_SIZE / GRID_SUBDIV);
               return <line key={`sv${i}`} x1={x} y1={0} x2={x} y2={canvasPxH}
-                stroke={gridColor} strokeOpacity={gridOpacity * 0.4} strokeWidth={(gridThickness * 0.5) / zoom} />;
+                stroke={gridColor} strokeOpacity={gridOpacity * (isMid ? 0.55 : 0.4)} strokeWidth={(gridThickness * (isMid ? 0.65 : 0.5)) / zoom} />;
             })}
             {Array.from({ length: rows * GRID_SUBDIV - 1 }, (_, idx) => {
               const i = idx + 1;
               if (i % GRID_SUBDIV === 0) return null;
+              const isMid = i % GRID_SUBDIV === GRID_SUBDIV / 2;
               const y = i * (CELL_SIZE / GRID_SUBDIV);
               return <line key={`sh${i}`} x1={0} y1={y} x2={canvasPxW} y2={y}
-                stroke={gridColor} strokeOpacity={gridOpacity * 0.4} strokeWidth={(gridThickness * 0.5) / zoom} />;
+                stroke={gridColor} strokeOpacity={gridOpacity * (isMid ? 0.55 : 0.4)} strokeWidth={(gridThickness * (isMid ? 0.65 : 0.5)) / zoom} />;
             })}
 
             {/* Main grid lines */}
