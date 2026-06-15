@@ -1,6 +1,6 @@
 import { useState, useRef, useCallback, useEffect } from "react";
 import { HexColorPicker } from "react-colorful";
-import { Eraser, Pen, Trash2, ZoomIn, ZoomOut, Maximize2, Undo2, Redo2, MousePointer2, FileImage, FileCode2, Printer, Grid3x3, Magnet, Ruler, Plus, Minus, Droplet, PaintBucket, Moon, Sun, Volume2, VolumeX, Hand, GripHorizontal, Menu, SlidersHorizontal, Dices } from "lucide-react";
+import { Eraser, Pen, Trash2, ZoomIn, ZoomOut, Maximize2, Undo2, Redo2, MousePointer2, FileImage, FileCode2, Printer, Grid3x3, Magnet, Ruler, Plus, Minus, Droplet, PaintBucket, Moon, Sun, Volume2, VolumeX, Hand, GripHorizontal, Menu, SlidersHorizontal, Dices, Save, FolderOpen } from "lucide-react";
 import { sfx, setSfxMuted } from "../sounds";
 import { Progress } from "./ui/progress";
 
@@ -25,6 +25,57 @@ const GRID_SUBDIV = 10;
 const MIN_ZOOM = 0.1;
 const MAX_ZOOM = 20;
 const MAX_UNDO = 60;
+
+// ── Editable project file (re-openable scene) ──
+// We serialize the *document* (dots + canvas/grid settings + brush state), not
+// the view (zoom/pan/rot) or UI prefs (theme/mute persist on their own). The
+// same shape is written to localStorage for autosave and downloaded as JSON.
+const PROJECT_VERSION = 1;
+const AUTOSAVE_KEY = "tangaliya-autosave";
+const PROJECT_TAG = "tangaliya-project";
+
+interface SceneFile {
+  app: typeof PROJECT_TAG;
+  version: number;
+  dots: Dot[];
+  unit: Unit;
+  cellPhysical: number;
+  canvasPhysW: number;
+  canvasPhysH: number;
+  canvasBg: string;
+  gridColor: string;
+  gridOpacity: number;
+  gridThickness: number;
+  snapMode: SnapMode;
+  color: string;
+  radius: number;
+  snapReach: number;
+  eraseRadius: number;
+  recentColors: string[];
+}
+
+// Light structural validation — never trust a file/localStorage blob.
+function parseScene(raw: string): SceneFile | null {
+  try {
+    const o = JSON.parse(raw);
+    if (!o || o.app !== PROJECT_TAG || !Array.isArray(o.dots)) return null;
+    if (!(o.canvasPhysW > 0) || !(o.canvasPhysH > 0) || !(o.cellPhysical > 0)) return null;
+    return o as SceneFile;
+  } catch { return null; }
+}
+
+// Build the live dot Map from a scene, dropping any malformed entries.
+function sceneToMap(scene: SceneFile | null): Map<string, Dot> {
+  const m = new Map<string, Dot>();
+  if (!scene) return m;
+  for (const d of scene.dots) {
+    if (d && typeof d.key === "string" && Number.isFinite(d.x) && Number.isFinite(d.y) &&
+        typeof d.color === "string" && Number.isFinite(d.radius)) {
+      m.set(d.key, { key: d.key, x: d.x, y: d.y, color: d.color, radius: d.radius });
+    }
+  }
+  return m;
+}
 
 const PALETTE = [
   "#FF2A2A", "#FF6B35", "#FFCC00", "#29CC74",
@@ -297,35 +348,44 @@ function ValueSlider({
 }
 
 export function DotArtTool() {
-  const [dots, setDots] = useState<Map<string, Dot>>(new Map());
+  // Restore the autosaved session once, before first paint, so the initial
+  // fit-to-view uses the right canvas size (no flash, no double-fit).
+  const bootRef = useRef<SceneFile | null | undefined>(undefined);
+  if (bootRef.current === undefined) {
+    try { bootRef.current = parseScene(localStorage.getItem(AUTOSAVE_KEY) ?? ""); }
+    catch { bootRef.current = null; }
+  }
+  const boot = bootRef.current;
+
+  const [dots, setDots] = useState<Map<string, Dot>>(() => sceneToMap(boot));
   const [undoCount, setUndoCount] = useState(0);
   const [redoCount, setRedoCount] = useState(0);
-  const [color, setColor] = useState("#FF2A2A");
-  const [recentColors, setRecentColors] = useState<string[]>([]);
-  const [radius, setRadius] = useState(3);
+  const [color, setColor] = useState(boot?.color ?? "#FF2A2A");
+  const [recentColors, setRecentColors] = useState<string[]>(boot?.recentColors ?? []);
+  const [radius, setRadius] = useState(boot?.radius ?? 3);
   // Stroke snap reach, % of a lattice step: how far away a point "catches"
   // the pen during a stroke. High = eager/loose, low = deliberate placement.
-  const [snapReach, setSnapReach] = useState(35);
+  const [snapReach, setSnapReach] = useState(boot?.snapReach ?? 35);
   // Eraser size in world px — its own state, deliberately NOT shared with the
   // draw dot radius (resizing the eraser must not change the brush).
-  const [eraseRadius, setEraseRadius] = useState(8);
+  const [eraseRadius, setEraseRadius] = useState(boot?.eraseRadius ?? 8);
   const [tool, setTool] = useState<Tool>("draw");
-  const [snapMode, setSnapMode] = useState<SnapMode>("both");
+  const [snapMode, setSnapMode] = useState<SnapMode>(boot?.snapMode ?? "both");
   const [preview, setPreview] = useState<{ x: number; y: number } | null>(null);
   const [viewportSize, setViewportSize] = useState({ width: 800, height: 600 });
-  const [canvasBg, setCanvasBg] = useState<string>("#ffffff");
-  const [gridColor, setGridColor] = useState("#000000");
-  const [gridOpacity, setGridOpacity] = useState(0.07);
-  const [gridThickness, setGridThickness] = useState(0.5);
+  const [canvasBg, setCanvasBg] = useState<string>(boot?.canvasBg ?? "#ffffff");
+  const [gridColor, setGridColor] = useState(boot?.gridColor ?? "#000000");
+  const [gridOpacity, setGridOpacity] = useState(boot?.gridOpacity ?? 0.07);
+  const [gridThickness, setGridThickness] = useState(boot?.gridThickness ?? 0.5);
 
   // ── Universal unit (project-wide) ──
-  const [unit, setUnit] = useState<Unit>("mm");
-  const [cellPhysical, setCellPhysical] = useState(10);          // value expressed in current `unit`
-  const [canvasPhysW, setCanvasPhysW] = useState(200);
-  const [canvasPhysH, setCanvasPhysH] = useState(150);
-  const [cellInput, setCellInput] = useState("10");
-  const [wInput, setWInput] = useState("200");
-  const [hInput, setHInput] = useState("150");
+  const [unit, setUnit] = useState<Unit>(boot?.unit ?? "mm");
+  const [cellPhysical, setCellPhysical] = useState(boot?.cellPhysical ?? 10);   // value expressed in current `unit`
+  const [canvasPhysW, setCanvasPhysW] = useState(boot?.canvasPhysW ?? 200);
+  const [canvasPhysH, setCanvasPhysH] = useState(boot?.canvasPhysH ?? 150);
+  const [cellInput, setCellInput] = useState(String(boot?.cellPhysical ?? 10));
+  const [wInput, setWInput] = useState(String(boot?.canvasPhysW ?? 200));
+  const [hInput, setHInput] = useState(String(boot?.canvasPhysH ?? 150));
 
   const [dark, setDark] = useState<boolean>(() => {
     try { return localStorage.getItem("tangaliya-theme") === "dark"; } catch { return false; }
@@ -1605,6 +1665,82 @@ export function DotArtTool() {
     img.src = url;
   }, [dots, canvasPxW, canvasPxH, pxPerUnit, unit, canvasBg, gridColor, gridOpacity, gridThickness, canvasPhysW, canvasPhysH]);
 
+  // ── Editable project: serialize / save / open / restore ──
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const buildScene = useCallback((): SceneFile => ({
+    app: PROJECT_TAG,
+    version: PROJECT_VERSION,
+    dots: Array.from(dots.values()),
+    unit, cellPhysical, canvasPhysW, canvasPhysH,
+    canvasBg, gridColor, gridOpacity, gridThickness,
+    snapMode, color, radius, snapReach, eraseRadius, recentColors,
+  }), [dots, unit, cellPhysical, canvasPhysW, canvasPhysH, canvasBg, gridColor,
+       gridOpacity, gridThickness, snapMode, color, radius, snapReach, eraseRadius, recentColors]);
+
+  // Replace the entire document with a loaded scene (undoable, re-fits the view).
+  const applyScene = useCallback((scene: SceneFile) => {
+    pushUndo();
+    const map = sceneToMap(scene);
+    setDots(map); dotsRef.current = map;
+    setSelectedKeys(new Set()); selectedKeysRef.current = new Set();
+
+    setUnit(scene.unit);
+    setCellPhysical(scene.cellPhysical); setCellInput(String(scene.cellPhysical));
+    setCanvasPhysW(scene.canvasPhysW); setWInput(String(scene.canvasPhysW));
+    setCanvasPhysH(scene.canvasPhysH); setHInput(String(scene.canvasPhysH));
+    setCanvasBg(scene.canvasBg);
+    setGridColor(scene.gridColor);
+    setGridOpacity(scene.gridOpacity);
+    setGridThickness(scene.gridThickness);
+    setSnapMode(scene.snapMode); snapModeRef.current = scene.snapMode;
+    setColor(scene.color); colorRef.current = scene.color;
+    setRadius(scene.radius); radiusRef.current = scene.radius;
+    setSnapReach(scene.snapReach); snapReachRef.current = scene.snapReach;
+    setEraseRadius(scene.eraseRadius); eraseRadiusRef.current = scene.eraseRadius;
+    if (Array.isArray(scene.recentColors)) setRecentColors(scene.recentColors);
+
+    // Fit the loaded canvas to the viewport. Computed from the scene's own
+    // dimensions (pure numbers via viewportRef) so it's correct immediately,
+    // without waiting for the new canvasPxW to flow through a render.
+    const pxW = scene.canvasPhysW * (CELL_SIZE / scene.cellPhysical);
+    const pxH = scene.canvasPhysH * (CELL_SIZE / scene.cellPhysical);
+    const pad = 60; const vp = viewportRef.current;
+    const availW = vp.width - pad * 2; const availH = vp.height - pad * 2;
+    if (availW > 0 && availH > 0 && pxW > 0 && pxH > 0) {
+      const z = Math.min(Math.max(Math.min(availW / pxW, availH / pxH, 4), MIN_ZOOM), MAX_ZOOM);
+      rotRef.current = 0; setRot(0);
+      applyViewport(z, { x: (vp.width - pxW * z) / 2, y: (vp.height - pxH * z) / 2 });
+    }
+  }, [pushUndo, applyViewport]);
+
+  const saveProject = useCallback(() => {
+    sfx.export();
+    const blob = new Blob([JSON.stringify(buildScene(), null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a"); a.href = url; a.download = "tangaliya-project.json"; a.click();
+    URL.revokeObjectURL(url);
+  }, [buildScene]);
+
+  const openProjectFile = useCallback((file: File) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const scene = parseScene(String(reader.result));
+      if (!scene) { alert("That doesn't look like a Tangaliya project file."); return; }
+      sfx.ui();
+      applyScene(scene);
+    };
+    reader.readAsText(file);
+  }, [applyScene]);
+
+  // Autosave the document to localStorage (debounced) on any change.
+  useEffect(() => {
+    const id = window.setTimeout(() => {
+      try { localStorage.setItem(AUTOSAVE_KEY, JSON.stringify(buildScene())); } catch { /* quota / private mode */ }
+    }, 400);
+    return () => window.clearTimeout(id);
+  }, [buildScene]);
+
   const HOLD_CLEAR_MS = 1000;
   const cancelClearHold = useCallback(() => {
     if (clearRafRef.current !== undefined) cancelAnimationFrame(clearRafRef.current);
@@ -1920,6 +2056,20 @@ export function DotArtTool() {
 
         {/* Export / footer card */}
         <div className="bg-[var(--card)] rounded-3xl p-3 shrink-0 flex flex-col gap-2">
+          {/* Editable project: save / reopen (separate from the image exports below) */}
+          <div className="flex gap-2">
+            <button onClick={saveProject} title="Download an editable project file"
+              className="flex-1 flex items-center justify-center gap-1.5 py-2.5 rounded-xl bg-[var(--ctl)] text-[var(--txt-1)] text-[13px] hover:bg-[var(--ctl-hover)] transition-colors">
+              <Save size={13} /> Save Project
+            </button>
+            <button onClick={() => fileInputRef.current?.click()} title="Open a saved project file"
+              className="flex-1 flex items-center justify-center gap-1.5 py-2.5 rounded-xl bg-[var(--ctl)] text-[var(--txt-1)] text-[13px] hover:bg-[var(--ctl-hover)] transition-colors">
+              <FolderOpen size={13} /> Open
+            </button>
+            <input ref={fileInputRef} type="file" accept="application/json,.json" className="hidden"
+              onChange={(e) => { const f = e.target.files?.[0]; if (f) openProjectFile(f); e.target.value = ""; }} />
+          </div>
+          <div className="h-px bg-[var(--ctl)] mx-1" />
           <div className="flex gap-2">
             <button onClick={exportSVG} className="flex-1 flex items-center justify-center gap-1 py-2.5 rounded-xl bg-[var(--ctl)] text-[var(--txt-1)] text-[13px] hover:bg-[var(--ctl-hover)] transition-colors">
               <FileCode2 size={13} /> SVG
