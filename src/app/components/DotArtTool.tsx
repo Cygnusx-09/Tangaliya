@@ -1,23 +1,15 @@
-import { useState, useRef, useCallback, useEffect } from "react";
+import { useState, useRef, useCallback, useEffect, useMemo } from "react";
 import { HexColorPicker } from "react-colorful";
-import { Eraser, Pen, Trash2, ZoomIn, ZoomOut, Maximize2, Undo2, Redo2, MousePointer2, FileImage, FileCode2, Printer, Grid3x3, Magnet, Ruler, Plus, Minus, Droplet, PaintBucket, Moon, Sun, Volume2, VolumeX, Hand, GripHorizontal, Menu, SlidersHorizontal, Dices, Save, FolderOpen } from "lucide-react";
+import { Eraser, Pen, Trash2, ZoomIn, ZoomOut, Maximize2, Undo2, Redo2, MousePointer2, FileImage, FileCode2, Printer, Grid3x3, Magnet, Ruler, Plus, Minus, Droplet, PaintBucket, Moon, Sun, Volume2, VolumeX, Hand, GripHorizontal, Menu, SlidersHorizontal, Dices, Save, FolderOpen, ImagePlus, Type } from "lucide-react";
 import { sfx, setSfxMuted } from "../sounds";
 import { Progress } from "./ui/progress";
+import {
+  CELL_SIZE, HALF_CELL, getKey, generateGridPoints, rgbToHex, computeImportDims,
+  buildDotsFromImage, buildDotsFromText, renderTextCanvas, type SnapMode, type Dot,
+} from "@/lib/dots";
 
-type SnapMode = "both" | "corner" | "center";
 type Tool = "draw" | "erase" | "select";
 type Unit = "mm" | "cm" | "in";
-
-interface Dot {
-  key: string;
-  x: number;
-  y: number;
-  color: string;
-  radius: number;
-}
-
-const CELL_SIZE = 20;
-const HALF_CELL = CELL_SIZE / 2;
 // Graph-paper minor lines: how many subdivisions per cell (visual only — does
 // NOT affect snapping). 5 = classic geography/engineering paper (5 small
 // squares between bold cell lines). 10 = millimeter-paper density.
@@ -70,7 +62,7 @@ function sceneToMap(scene: SceneFile | null): Map<string, Dot> {
   if (!scene) return m;
   for (const d of scene.dots) {
     if (d && typeof d.key === "string" && Number.isFinite(d.x) && Number.isFinite(d.y) &&
-        typeof d.color === "string" && Number.isFinite(d.radius)) {
+      typeof d.color === "string" && Number.isFinite(d.radius)) {
       m.set(d.key, { key: d.key, x: d.x, y: d.y, color: d.color, radius: d.radius });
     }
   }
@@ -121,10 +113,6 @@ function loadVision(): Promise<{ vision: any; fileset: any }> {
     })();
   }
   return visionPromise;
-}
-
-function getKey(halfCol: number, halfRow: number) {
-  return `${halfCol},${halfRow}`;
 }
 
 function getNearestSnap(
@@ -371,6 +359,23 @@ export function DotArtTool() {
   const [eraseRadius, setEraseRadius] = useState(boot?.eraseRadius ?? 8);
   const [tool, setTool] = useState<Tool>("draw");
   const [snapMode, setSnapMode] = useState<SnapMode>(boot?.snapMode ?? "both");
+  // Image import: a modal tunes the conversion; "Add to canvas" commits the dots.
+  // These aren't part of the saved scene — they only configure the conversion.
+  const [importOpen, setImportOpen] = useState(false);
+  const [importImg, setImportImg] = useState<ImageBitmap | null>(null);
+  const [traceStyle, setTraceStyle] = useState<"color" | "mono" | "tonal">("color");
+  const [traceThreshold, setTraceThreshold] = useState(0.5);
+  const [traceDotSize, setTraceDotSize] = useState(8);          // world-px dot radius
+  const [traceDetail, setTraceDetail] = useState<SnapMode>("both"); // sub-cell fill
+  const [importCell, setImportCell] = useState(10);             // cell size for the import (current unit)
+  const [traceTonalColor, setTraceTonalColor] = useState(false); // Light & Shadow: keep image colors
+  // Text → Dots mode (separate modal): typed text in an uploaded font, dissolved.
+  const [textOpen, setTextOpen] = useState(false);
+  const [textValue, setTextValue] = useState("Prompt them.\nStack them.\nShare them.");
+  const [textFontFamily, setTextFontFamily] = useState<string | null>(null);
+  const [textFontName, setTextFontName] = useState("");
+  const [textColor, setTextColor] = useState("#d4ff3f");
+  const [traceScatter, setTraceScatter] = useState(0.35);
   const [preview, setPreview] = useState<{ x: number; y: number } | null>(null);
   const [viewportSize, setViewportSize] = useState({ width: 800, height: 600 });
   const [canvasBg, setCanvasBg] = useState<string>(boot?.canvasBg ?? "#ffffff");
@@ -1667,6 +1672,10 @@ export function DotArtTool() {
 
   // ── Editable project: serialize / save / open / restore ──
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const imageInputRef = useRef<HTMLInputElement>(null);
+  const importPreviewRef = useRef<HTMLCanvasElement>(null); // the modal's preview canvas
+  const fontInputRef = useRef<HTMLInputElement>(null);
+  const textPreviewRef = useRef<HTMLCanvasElement>(null);
 
   const buildScene = useCallback((): SceneFile => ({
     app: PROJECT_TAG,
@@ -1676,7 +1685,7 @@ export function DotArtTool() {
     canvasBg, gridColor, gridOpacity, gridThickness,
     snapMode, color, radius, snapReach, eraseRadius, recentColors,
   }), [dots, unit, cellPhysical, canvasPhysW, canvasPhysH, canvasBg, gridColor,
-       gridOpacity, gridThickness, snapMode, color, radius, snapReach, eraseRadius, recentColors]);
+    gridOpacity, gridThickness, snapMode, color, radius, snapReach, eraseRadius, recentColors]);
 
   // Replace the entire document with a loaded scene (undoable, re-fits the view).
   const applyScene = useCallback((scene: SceneFile) => {
@@ -1732,6 +1741,157 @@ export function DotArtTool() {
     };
     reader.readAsText(file);
   }, [applyScene]);
+
+  // ── Image import (modal) ──
+  // The "Import Image" modal tunes a conversion against a loaded image and shows
+  // a live preview; "Add to canvas" commits the dots to the real editor.
+
+  // Target canvas dims matching the loaded image's aspect ratio (keeps the cell
+  // size and the current long-edge cell count). Drives both preview and commit.
+  const importDims = useMemo(() => {
+    if (!importImg) return null;
+    const longPhys = Math.max(canvasPhysW, canvasPhysH) || 1;
+    return computeImportDims(importImg.width, importImg.height, longPhys, importCell);
+  }, [importImg, canvasPhysW, canvasPhysH, importCell]);
+
+  // Live preview dots — recomputed whenever the image or any control changes.
+  const previewDots = useMemo(() => {
+    if (!importImg || !importDims) return null;
+    return buildDotsFromImage(importImg, importDims.pxW, importDims.pxH, {
+      style: traceStyle, threshold: traceThreshold, dotRadius: traceDotSize, snapMode: traceDetail, monoColor: color, tonalColor: traceTonalColor,
+    });
+  }, [importImg, importDims, traceStyle, traceThreshold, traceDotSize, traceDetail, color, traceTonalColor]);
+
+  const openImportFile = useCallback(async (file: File) => {
+    try {
+      const bitmap = await createImageBitmap(file);
+      setImportImg(bitmap);
+    } catch {
+      alert("Couldn't read that image.");
+    }
+  }, []);
+
+  // Close the modal and drop the loaded image so each open starts fresh.
+  const closeImport = useCallback(() => { setImportOpen(false); setImportImg(null); }, []);
+
+  // Shared commit: resize the canvas to the source aspect + cell size, fit the
+  // view, and replace the dots (undoable). Used by the image and text modals.
+  const commitDots = useCallback((map: Map<string, Dot>, dims: { pxW: number; pxH: number; physW: number; physH: number }, cell: number) => {
+    const { pxW, pxH, physW, physH } = dims;
+    setCellPhysical(cell); setCellInput(String(cell));
+    setCanvasPhysW(physW); setWInput(String(physW));
+    setCanvasPhysH(physH); setHInput(String(physH));
+    canvasBoundsRef.current = { w: pxW, h: pxH };
+
+    const pad = 60; const vp = viewportRef.current;
+    const availW = vp.width - pad * 2, availH = vp.height - pad * 2;
+    if (availW > 0 && availH > 0) {
+      const z = Math.min(Math.max(Math.min(availW / pxW, availH / pxH, 4), MIN_ZOOM), MAX_ZOOM);
+      rotRef.current = 0; setRot(0);
+      applyViewport(z, { x: (vp.width - pxW * z) / 2, y: (vp.height - pxH * z) / 2 });
+    }
+
+    pushUndo();
+    const next = new Map(map);
+    setDots(next); dotsRef.current = next;
+    setSelectedKeys(new Set()); selectedKeysRef.current = new Set();
+    sfx.ui();
+  }, [pushUndo, applyViewport]);
+
+  const addImportToCanvas = useCallback(() => {
+    if (!importDims || !previewDots) return;
+    commitDots(previewDots, importDims, importCell);
+    setImportOpen(false); setImportImg(null);
+  }, [importDims, previewDots, importCell, commitDots]);
+
+  // Render the preview dots into the modal's canvas (fit to a fixed box).
+  useEffect(() => {
+    const cv = importPreviewRef.current;
+    if (!cv || !importDims) return;
+    const BOX = 420;
+    const s = Math.min(BOX / importDims.pxW, BOX / importDims.pxH);
+    cv.width = Math.round(importDims.pxW * s);
+    cv.height = Math.round(importDims.pxH * s);
+    const ctx = cv.getContext("2d");
+    if (!ctx) return;
+    ctx.fillStyle = canvasBg;
+    ctx.fillRect(0, 0, cv.width, cv.height);
+    if (!previewDots) return;
+    ctx.scale(s, s);
+    for (const d of previewDots.values()) {
+      ctx.fillStyle = d.color;
+      ctx.beginPath();
+      ctx.arc(d.x, d.y, d.radius, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }, [previewDots, importDims, canvasBg, importOpen]);
+
+  // ── Text → Dots ──
+  // Load an uploaded font locally (no network) and register it for canvas use.
+  const loadFontFile = useCallback(async (file: File) => {
+    try {
+      const buf = await file.arrayBuffer();
+      const family = `DotFont-${Date.now()}`;
+      const face = new FontFace(family, buf);
+      await face.load();
+      (document as Document & { fonts: FontFaceSet }).fonts.add(face);
+      setTextFontFamily(family);
+      setTextFontName(file.name.replace(/\.[^.]+$/, ""));
+    } catch {
+      alert("Couldn't load that font file.");
+    }
+  }, []);
+
+  // Render the typed text onto a tight offscreen canvas (white on transparent).
+  // High raster size — final scale comes from the cell size, not here.
+  const textCanvas = useMemo(
+    () => (textOpen ? renderTextCanvas(textValue, textFontFamily) : null),
+    [textValue, textFontFamily, textOpen]
+  );
+
+  const textDims = useMemo(() => {
+    if (!textCanvas) return null;
+    const longPhys = Math.max(canvasPhysW, canvasPhysH) || 1;
+    return computeImportDims(textCanvas.width, textCanvas.height, longPhys, importCell);
+  }, [textCanvas, canvasPhysW, canvasPhysH, importCell]);
+
+  const textDots = useMemo(() => {
+    if (!textCanvas || !textDims) return null;
+    return buildDotsFromText(textCanvas, textDims.pxW, textDims.pxH, {
+      style: traceStyle, threshold: traceThreshold, dotRadius: traceDotSize,
+      snapMode: traceDetail, textColor, monoColor: color, scatter: traceScatter,
+    });
+  }, [textCanvas, textDims, traceStyle, traceThreshold, traceDotSize, traceDetail, textColor, color, traceScatter]);
+
+  const closeText = useCallback(() => setTextOpen(false), []);
+
+  const addTextToCanvas = useCallback(() => {
+    if (!textDims || !textDots) return;
+    commitDots(textDots, textDims, importCell);
+    setTextOpen(false);
+  }, [textDims, textDots, importCell, commitDots]);
+
+  // Paint the text preview dots into the modal's canvas.
+  useEffect(() => {
+    const cv = textPreviewRef.current;
+    if (!cv || !textDims) return;
+    const BOX = 420;
+    const s = Math.min(BOX / textDims.pxW, BOX / textDims.pxH);
+    cv.width = Math.round(textDims.pxW * s);
+    cv.height = Math.round(textDims.pxH * s);
+    const ctx = cv.getContext("2d");
+    if (!ctx) return;
+    ctx.fillStyle = canvasBg;
+    ctx.fillRect(0, 0, cv.width, cv.height);
+    if (!textDots) return;
+    ctx.scale(s, s);
+    for (const d of textDots.values()) {
+      ctx.fillStyle = d.color;
+      ctx.beginPath();
+      ctx.arc(d.x, d.y, d.radius, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }, [textDots, textDims, canvasBg, textOpen]);
 
   // Autosave the document to localStorage (debounced) on any change.
   useEffect(() => {
@@ -2069,6 +2229,31 @@ export function DotArtTool() {
             <input ref={fileInputRef} type="file" accept="application/json,.json" className="hidden"
               onChange={(e) => { const f = e.target.files?.[0]; if (f) openProjectFile(f); e.target.value = ""; }} />
           </div>
+
+          {/* Image / Text → dots: each opens a modal to tune, preview, then commit */}
+          <div className="flex gap-2">
+            <button onClick={() => { setImportCell(cellPhysical); setImportOpen(true); }} title="Convert an image into editable dots"
+              className="flex-1 flex items-center justify-center gap-1.5 py-2.5 rounded-xl bg-[var(--ctl)] text-[var(--txt-1)] text-[13px] hover:bg-[var(--ctl-hover)] transition-colors">
+              <ImagePlus size={13} /> Image
+            </button>
+            <button onClick={() => { setImportCell(cellPhysical); setTextOpen(true); }} title="Convert typed text in any font into dissolving dots"
+              className="flex-1 flex items-center justify-center gap-1.5 py-2.5 rounded-xl bg-[var(--ctl)] text-[var(--txt-1)] text-[13px] hover:bg-[var(--ctl-hover)] transition-colors">
+              <Type size={13} /> Text
+            </button>
+          </div>
+          <div className="flex gap-2">
+            <button onClick={() => window.open(`${import.meta.env.BASE_URL}image.html`, "_blank")}
+              title="Open the full-screen image tool in a new tab"
+              className="flex-1 flex items-center justify-center gap-1.5 py-2 rounded-xl bg-transparent text-[var(--txt-2)] text-[12px] hover:bg-[var(--ctl)] transition-colors">
+              <ImagePlus size={12} /> Image tool ↗
+            </button>
+            <button onClick={() => window.open(`${import.meta.env.BASE_URL}text.html`, "_blank")}
+              title="Open the full-screen text tool in a new tab"
+              className="flex-1 flex items-center justify-center gap-1.5 py-2 rounded-xl bg-transparent text-[var(--txt-2)] text-[12px] hover:bg-[var(--ctl)] transition-colors">
+              <Type size={12} /> Text tool ↗
+            </button>
+          </div>
+
           <div className="h-px bg-[var(--ctl)] mx-1" />
           <div className="flex gap-2">
             <button onClick={exportSVG} className="flex-1 flex items-center justify-center gap-1 py-2.5 rounded-xl bg-[var(--ctl)] text-[var(--txt-1)] text-[13px] hover:bg-[var(--ctl-hover)] transition-colors">
@@ -2462,6 +2647,251 @@ export function DotArtTool() {
       {compact && (leftOpen || rightOpen) && (
         <div className="fixed inset-0 z-40 bg-black/30"
           onClick={() => { setLeftOpen(false); setRightOpen(false); }} />
+      )}
+
+      {/* ── Image import modal ── tune the conversion, then add to canvas ── */}
+      {importOpen && (
+        <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/50 p-4"
+          onClick={closeImport}>
+          <div onClick={(e) => e.stopPropagation()}
+            className="dotart bg-[var(--card)] text-[var(--txt-1)] rounded-3xl p-5 w-full max-w-[760px] max-h-[90vh] overflow-auto flex flex-col gap-4 shadow-2xl">
+            <div className="flex items-center justify-between">
+              <h2 className="text-[16px] font-medium flex items-center gap-2"><ImagePlus size={16} /> Import Image</h2>
+              <button onClick={closeImport}
+                className="px-3 py-1.5 rounded-lg bg-[var(--ctl)] text-[13px] hover:bg-[var(--ctl-hover)]">Close</button>
+            </div>
+
+            <div className="flex flex-col sm:flex-row gap-4">
+              {/* Preview */}
+              <div className="flex-1 min-w-0">
+                <div className="rounded-2xl bg-[var(--ctl)] p-2 flex items-center justify-center min-h-[260px]"
+                  style={{ minHeight: 260 }}>
+                  {importImg
+                    ? <canvas ref={importPreviewRef} className="max-w-full max-h-[60vh] rounded-lg" />
+                    : <span className="text-[13px] text-[var(--txt-3)]">Choose an image to preview</span>}
+                </div>
+                <button onClick={() => imageInputRef.current?.click()}
+                  className="mt-2 w-full py-2.5 rounded-xl bg-[var(--ctl)] text-[13px] hover:bg-[var(--ctl-hover)]">
+                  {importImg ? "Choose a different image…" : "Choose image…"}
+                </button>
+                <input ref={imageInputRef} type="file" accept="image/*" className="hidden"
+                  onChange={(e) => { const f = e.target.files?.[0]; if (f) openImportFile(f); e.target.value = ""; }} />
+              </div>
+
+              {/* Controls */}
+              <div className="w-full sm:w-[260px] shrink-0 flex flex-col gap-4">
+                <div>
+                  <div className="text-[12px] text-[var(--txt-3)] mb-1.5">Style</div>
+                  <div className="flex gap-1">
+                    {([["color", "Color"], ["mono", "Mono"], ["tonal", "Light & Shadow"]] as const).map(([s, lbl]) => (
+                      <button key={s} onClick={() => setTraceStyle(s)}
+                        className={`flex-1 py-1.5 px-1 rounded-lg text-[11px] leading-tight transition-colors ${traceStyle === s ? "bg-[var(--solid)] text-white" : "bg-[var(--ctl)] text-[var(--txt-2)] hover:bg-[var(--ctl-hover)]"}`}>
+                        {lbl}
+                      </button>
+                    ))}
+                  </div>
+                  {traceStyle === "mono" && (
+                    <label className="flex items-center gap-2 mt-2 text-[12px] text-[var(--txt-2)]">
+                      Dot color
+                      <input type="color" value={color} onChange={(e) => { setColor(e.target.value); colorRef.current = e.target.value; }}
+                        className="w-8 h-6 rounded cursor-pointer bg-transparent" />
+                    </label>
+                  )}
+                  {traceStyle === "tonal" && (
+                    <label className="flex items-center gap-2 mt-2 text-[12px] text-[var(--txt-2)] cursor-pointer">
+                      <input type="checkbox" checked={traceTonalColor}
+                        onChange={(e) => setTraceTonalColor(e.target.checked)}
+                        className="accent-[var(--solid)]" />
+                      Use image colors
+                    </label>
+                  )}
+                  <p className="text-[11px] text-[var(--txt-3)] leading-snug mt-1.5">
+                    {traceStyle === "color" ? "Each dot uses the image's color."
+                      : traceStyle === "mono" ? "All dots one color, uniform size."
+                        : traceTonalColor ? "Image-colored dots sized by tone — shadows big, highlights small."
+                          : "Gray dots sized by tone — shadows big, highlights small."}
+                  </p>
+                </div>
+
+                <label className="flex items-center gap-2 text-[12px] text-[var(--txt-2)]">
+                  <span className="w-16 shrink-0">Dot size</span>
+                  <input type="range" min={2} max={20} step={0.5} value={traceDotSize}
+                    onChange={(e) => setTraceDotSize(parseFloat(e.target.value))}
+                    className="flex-1 accent-[var(--solid)]" />
+                  <span className="w-8 text-right tabular-nums">{traceDotSize}</span>
+                </label>
+
+                <label className="flex items-center gap-2 text-[12px] text-[var(--txt-2)]">
+                  <span className="w-16 shrink-0">{traceStyle === "tonal" ? "Shadow" : "Density"}</span>
+                  <input type="range" min={0} max={1} step={0.01} value={traceThreshold}
+                    onChange={(e) => setTraceThreshold(parseFloat(e.target.value))}
+                    className="flex-1 accent-[var(--solid)]" />
+                  <span className="w-8 text-right tabular-nums">{traceThreshold.toFixed(2)}</span>
+                </label>
+
+                {(() => {
+                  const longPhys = Math.max(canvasPhysW, canvasPhysH) || 1;
+                  const minCell = longPhys / 100, maxCell = longPhys / 8;
+                  const cell = Math.min(Math.max(importCell, minCell), maxCell);
+                  return (
+                    <label className="flex items-center gap-2 text-[12px] text-[var(--txt-2)]">
+                      <span className="w-16 shrink-0">Cell size</span>
+                      <input type="range" min={minCell} max={maxCell} step={(maxCell - minCell) / 200} value={cell}
+                        onChange={(e) => setImportCell(parseFloat(e.target.value))}
+                        className="flex-1 accent-[var(--solid)]" />
+                      <span className="w-14 text-right tabular-nums">{importCell.toFixed(1)}{unit}</span>
+                    </label>
+                  );
+                })()}
+
+                <div>
+                  <div className="text-[12px] text-[var(--txt-3)] mb-1.5">Sub-cell fill</div>
+                  <div className="flex gap-1">
+                    {([["corner", "Coarse"], ["both", "Fine"]] as const).map(([s, lbl]) => (
+                      <button key={s} onClick={() => setTraceDetail(s)}
+                        className={`flex-1 py-1.5 rounded-lg text-[12px] transition-colors ${traceDetail === s ? "bg-[var(--solid)] text-white" : "bg-[var(--ctl)] text-[var(--txt-2)] hover:bg-[var(--ctl-hover)]"}`}>
+                        {lbl}
+                      </button>
+                    ))}
+                  </div>
+                  <p className="text-[11px] text-[var(--txt-3)] leading-snug mt-1.5">
+                    {importDims ? `${importDims.cols}×${importDims.rows} cells` : "—"} · {previewDots ? `${previewDots.size} dots` : "—"}. Smaller cell = finer grid.
+                  </p>
+                </div>
+              </div>
+            </div>
+
+            <div className="flex justify-end gap-2 pt-1">
+              <button onClick={closeImport}
+                className="px-4 py-2.5 rounded-xl bg-[var(--ctl)] text-[13px] hover:bg-[var(--ctl-hover)]">Cancel</button>
+              <button onClick={addImportToCanvas} disabled={!previewDots}
+                className="px-5 py-2.5 rounded-xl bg-[var(--solid)] text-white text-[13px] disabled:opacity-40 disabled:cursor-not-allowed hover:opacity-90">
+                Add to canvas
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Text → Dots modal ── typed text in any font, dissolved into dots ── */}
+      {textOpen && (
+        <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/50 p-4"
+          onClick={closeText}>
+          <div onClick={(e) => e.stopPropagation()}
+            className="dotart bg-[var(--card)] text-[var(--txt-1)] rounded-3xl p-5 w-full max-w-[760px] max-h-[90vh] overflow-auto flex flex-col gap-4 shadow-2xl">
+            <div className="flex items-center justify-between">
+              <h2 className="text-[16px] font-medium flex items-center gap-2"><Type size={16} /> Text → Dots</h2>
+              <button onClick={closeText}
+                className="px-3 py-1.5 rounded-lg bg-[var(--ctl)] text-[13px] hover:bg-[var(--ctl-hover)]">Close</button>
+            </div>
+
+            <div className="flex flex-col sm:flex-row gap-4">
+              {/* Preview */}
+              <div className="flex-1 min-w-0">
+                <div className="rounded-2xl bg-[var(--ctl)] p-2 flex items-center justify-center" style={{ minHeight: 260 }}>
+                  {textDots
+                    ? <canvas ref={textPreviewRef} className="max-w-full max-h-[60vh] rounded-lg" />
+                    : <span className="text-[13px] text-[var(--txt-3)]">Type something to preview</span>}
+                </div>
+                <textarea value={textValue} onChange={(e) => setTextValue(e.target.value)} rows={3}
+                  placeholder="Type text… (Enter for a new line)"
+                  className="mt-2 w-full p-3 rounded-xl bg-[var(--ctl)] text-[var(--txt-1)] text-[14px] resize-none outline-none" />
+                <button onClick={() => fontInputRef.current?.click()}
+                  className="mt-2 w-full py-2.5 rounded-xl bg-[var(--ctl)] text-[13px] hover:bg-[var(--ctl-hover)]">
+                  {textFontName ? `Font: ${textFontName} — change…` : "Upload font (.ttf / .otf / .woff)…"}
+                </button>
+                <input ref={fontInputRef} type="file" accept=".ttf,.otf,.woff,.woff2,font/*" className="hidden"
+                  onChange={(e) => { const f = e.target.files?.[0]; if (f) loadFontFile(f); e.target.value = ""; }} />
+              </div>
+
+              {/* Controls */}
+              <div className="w-full sm:w-[260px] shrink-0 flex flex-col gap-4">
+                <div>
+                  <div className="text-[12px] text-[var(--txt-3)] mb-1.5">Style</div>
+                  <div className="flex gap-1">
+                    {([["color", "Color"], ["mono", "Mono"], ["tonal", "Light & Shadow"]] as const).map(([s, lbl]) => (
+                      <button key={s} onClick={() => setTraceStyle(s)}
+                        className={`flex-1 py-1.5 px-1 rounded-lg text-[11px] leading-tight transition-colors ${traceStyle === s ? "bg-[var(--solid)] text-white" : "bg-[var(--ctl)] text-[var(--txt-2)] hover:bg-[var(--ctl-hover)]"}`}>
+                        {lbl}
+                      </button>
+                    ))}
+                  </div>
+                  {traceStyle !== "tonal" && (
+                    <label className="flex items-center gap-2 mt-2 text-[12px] text-[var(--txt-2)]">
+                      {traceStyle === "mono" ? "Dot color" : "Text color"}
+                      <input type="color" value={traceStyle === "mono" ? color : textColor}
+                        onChange={(e) => traceStyle === "mono" ? (setColor(e.target.value), colorRef.current = e.target.value) : setTextColor(e.target.value)}
+                        className="w-8 h-6 rounded cursor-pointer bg-transparent" />
+                    </label>
+                  )}
+                </div>
+
+                <label className="flex items-center gap-2 text-[12px] text-[var(--txt-2)]">
+                  <span className="w-16 shrink-0">Dot size</span>
+                  <input type="range" min={2} max={20} step={0.5} value={traceDotSize}
+                    onChange={(e) => setTraceDotSize(parseFloat(e.target.value))}
+                    className="flex-1 accent-[var(--solid)]" />
+                  <span className="w-8 text-right tabular-nums">{traceDotSize}</span>
+                </label>
+
+                <label className="flex items-center gap-2 text-[12px] text-[var(--txt-2)]">
+                  <span className="w-16 shrink-0">Scatter</span>
+                  <input type="range" min={0} max={1} step={0.01} value={traceScatter}
+                    onChange={(e) => setTraceScatter(parseFloat(e.target.value))}
+                    className="flex-1 accent-[var(--solid)]" />
+                  <span className="w-8 text-right tabular-nums">{traceScatter.toFixed(2)}</span>
+                </label>
+
+                <label className="flex items-center gap-2 text-[12px] text-[var(--txt-2)]">
+                  <span className="w-16 shrink-0">Density</span>
+                  <input type="range" min={0} max={1} step={0.01} value={traceThreshold}
+                    onChange={(e) => setTraceThreshold(parseFloat(e.target.value))}
+                    className="flex-1 accent-[var(--solid)]" />
+                  <span className="w-8 text-right tabular-nums">{traceThreshold.toFixed(2)}</span>
+                </label>
+
+                {(() => {
+                  const longPhys = Math.max(canvasPhysW, canvasPhysH) || 1;
+                  const minCell = longPhys / 100, maxCell = longPhys / 8;
+                  const cell = Math.min(Math.max(importCell, minCell), maxCell);
+                  return (
+                    <label className="flex items-center gap-2 text-[12px] text-[var(--txt-2)]">
+                      <span className="w-16 shrink-0">Cell size</span>
+                      <input type="range" min={minCell} max={maxCell} step={(maxCell - minCell) / 200} value={cell}
+                        onChange={(e) => setImportCell(parseFloat(e.target.value))}
+                        className="flex-1 accent-[var(--solid)]" />
+                      <span className="w-14 text-right tabular-nums">{importCell.toFixed(1)}{unit}</span>
+                    </label>
+                  );
+                })()}
+
+                <div>
+                  <div className="text-[12px] text-[var(--txt-3)] mb-1.5">Sub-cell fill</div>
+                  <div className="flex gap-1">
+                    {([["corner", "Coarse"], ["both", "Fine"]] as const).map(([s, lbl]) => (
+                      <button key={s} onClick={() => setTraceDetail(s)}
+                        className={`flex-1 py-1.5 rounded-lg text-[12px] transition-colors ${traceDetail === s ? "bg-[var(--solid)] text-white" : "bg-[var(--ctl)] text-[var(--txt-2)] hover:bg-[var(--ctl-hover)]"}`}>
+                        {lbl}
+                      </button>
+                    ))}
+                  </div>
+                  <p className="text-[11px] text-[var(--txt-3)] leading-snug mt-1.5">
+                    {textDims ? `${textDims.cols}×${textDims.rows} cells` : "—"} · {textDots ? `${textDots.size} dots` : "—"}.
+                  </p>
+                </div>
+              </div>
+            </div>
+
+            <div className="flex justify-end gap-2 pt-1">
+              <button onClick={closeText}
+                className="px-4 py-2.5 rounded-xl bg-[var(--ctl)] text-[13px] hover:bg-[var(--ctl-hover)]">Cancel</button>
+              <button onClick={addTextToCanvas} disabled={!textDots}
+                className="px-5 py-2.5 rounded-xl bg-[var(--solid)] text-white text-[13px] disabled:opacity-40 disabled:cursor-not-allowed hover:opacity-90">
+                Add to canvas
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );

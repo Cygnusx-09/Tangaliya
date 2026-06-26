@@ -19,6 +19,17 @@ export default defineConfig({
     },
   },
 
+  // Multi-page: the editor (index.html) + the standalone full-screen image tool.
+  build: {
+    rollupOptions: {
+      input: {
+        main: path.resolve(__dirname, 'index.html'),
+        image: path.resolve(__dirname, 'image.html'),
+        text: path.resolve(__dirname, 'text.html'),
+      },
+    },
+  },
+
   // File types to support raw imports. Never add .css, .tsx, or .ts files to this.
   assetsInclude: ['**/*.svg', '**/*.csv'],
 })
