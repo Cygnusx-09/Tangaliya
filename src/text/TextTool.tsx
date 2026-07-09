@@ -512,7 +512,7 @@ export default function TextTool() {
         files.push({ name: `frame_${String(i).padStart(4, "0")}.png`, data: new Uint8Array(await blob.arrayBuffer()) });
         setRenderPct(Math.round(((i + 1) / n) * 100));
       }
-      downloadBlob(new Blob([buildZip(files)], { type: "application/zip" }), "dot-text-frames.zip");
+      downloadBlob(new Blob([buildZip(files) as BlobPart], { type: "application/zip" }), "dot-text-frames.zip");
     } catch {
       alert("Frame export failed.");
     } finally {
