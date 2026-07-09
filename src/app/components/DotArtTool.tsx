@@ -2088,18 +2088,26 @@ export function DotArtTool() {
     const scale = 4;
     const outW = Math.max(1, Math.round(canvasPxW * scale));
     const outH = Math.max(1, Math.round(canvasPxH * scale));
+    const captionH = Math.round(24 * scale); // reserved white strip below the artwork
     const svgBlob = new Blob([content], { type: "image/svg+xml;charset=utf-8" });
     const url = URL.createObjectURL(svgBlob);
     const img = new Image();
     img.onload = () => {
       const canvas = document.createElement("canvas");
-      canvas.width = outW; canvas.height = outH;
+      canvas.width = outW; canvas.height = outH + captionH;
       const ctx = canvas.getContext("2d");
       if (!ctx) { URL.revokeObjectURL(url); return; }
       ctx.imageSmoothingEnabled = true;
       ctx.imageSmoothingQuality = "high";
       ctx.drawImage(img, 0, 0, outW, outH);
       URL.revokeObjectURL(url);
+      // White caption strip — readable regardless of the artwork's own background color.
+      ctx.fillStyle = "#ffffff";
+      ctx.fillRect(0, outH, outW, captionH);
+      ctx.fillStyle = "#888888";
+      ctx.font = `${Math.round(13 * scale)}px sans-serif`;
+      ctx.textBaseline = "middle";
+      ctx.fillText(`${allDots.length} dots`, Math.round(8 * scale), outH + captionH / 2);
       canvas.toBlob((blob) => {
         if (!blob) return;
         const dlUrl = URL.createObjectURL(blob);
