@@ -3780,7 +3780,7 @@ export function DotArtTool() {
                 <div>
                   <div className="text-[12px] text-[var(--txt-3)] mb-1.5">Sub-cell fill</div>
                   <div className="flex gap-1">
-                    {([["corner", "Coarse"], ["both", "Fine"]] as const).map(([s, lbl]) => (
+                    {([["corner", "Coarse"], ["both", "Fine"], ["fine", "Sub-grid"]] as const).map(([s, lbl]) => (
                       <button key={s} onClick={() => setTraceDetail(s)}
                         className={`flex-1 py-1.5 rounded-lg text-[12px] transition-colors ${traceDetail === s ? "bg-[var(--solid)] text-white" : "bg-[var(--ctl)] text-[var(--txt-2)] hover:bg-[var(--ctl-hover)]"}`}>
                         {lbl}
@@ -3901,7 +3901,7 @@ export function DotArtTool() {
                 <div>
                   <div className="text-[12px] text-[var(--txt-3)] mb-1.5">Sub-cell fill</div>
                   <div className="flex gap-1">
-                    {([["corner", "Coarse"], ["both", "Fine"]] as const).map(([s, lbl]) => (
+                    {([["corner", "Coarse"], ["both", "Fine"], ["fine", "Sub-grid"]] as const).map(([s, lbl]) => (
                       <button key={s} onClick={() => setTraceDetail(s)}
                         className={`flex-1 py-1.5 rounded-lg text-[12px] transition-colors ${traceDetail === s ? "bg-[var(--solid)] text-white" : "bg-[var(--ctl)] text-[var(--txt-2)] hover:bg-[var(--ctl-hover)]"}`}>
                         {lbl}

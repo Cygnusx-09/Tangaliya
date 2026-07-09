@@ -1,23 +1,15 @@
 // snap.ts — the half-cell/sub-grid snap lattice math, extracted verbatim from
 // DotArtTool.tsx (module scope, no React/ref coupling — see ARCHITECTURE.md).
 
-import { CELL_SIZE, HALF_CELL, getKey, type SnapMode } from "@/lib/dots";
+import { CELL_SIZE, HALF_CELL, getKey, GRID_SUBDIV, FINE_CELL, getFineKey, type SnapMode } from "@/lib/dots";
 
-// Graph-paper minor lines: how many subdivisions per cell. 5 = classic
-// geography/engineering paper (5 small squares between bold cell lines).
-// 10 = millimeter-paper density. Also doubles as the resolution of "Sub-grid"
-// snap mode below — the two are deliberately the same number so dots in that
-// mode land exactly on the visible minor lines.
-export const GRID_SUBDIV = 10;
-// One subdivision cell — the lattice step for "Sub-grid" snap mode.
-export const FINE_CELL = CELL_SIZE / GRID_SUBDIV;
-// Sub-grid points live on a finer lattice than the half-cell one every other
-// snap mode uses, so they get their own key namespace ("f:col,row") — this
-// guarantees they can never collide with an existing half-cell key even
-// though both are just small integer pairs.
-export function getFineKey(fc: number, fr: number) {
-  return `f:${fc},${fr}`;
-}
+// GRID_SUBDIV/FINE_CELL/getFineKey now live in dots.ts (the base module with
+// no lib-internal dependencies) — buildDotsFromImage/buildDotsFromText need
+// them too, and snap.ts already depends on dots.ts, so this avoids a cycle.
+// Re-exported here so existing imports of these three from "@/lib/snap"
+// don't need to change.
+export { GRID_SUBDIV, FINE_CELL, getFineKey };
+
 // The lattice step size a given snap mode places/moves dots on.
 export function snapSpacing(mode: SnapMode): number {
   return mode === "fine" ? FINE_CELL : mode === "both" ? HALF_CELL : CELL_SIZE;
