@@ -2132,18 +2132,22 @@ export function DotArtTool() {
 
       const { jsPDF } = await import("jspdf");
       const orientation = widthMm > heightMm ? "landscape" : "portrait";
+      const captionMm = 6; // reserved strip below the artwork for the dot-count caption
       const pdf = new jsPDF({
         orientation: orientation as "landscape" | "portrait",
         unit: "mm",
-        format: [widthMm, heightMm],
+        format: [widthMm, heightMm + captionMm],
       });
       const imgData = canvas.toDataURL("image/png");
       pdf.addImage(imgData, "PNG", 0, 0, widthMm, heightMm);
+      pdf.setFontSize(9);
+      pdf.setTextColor(120);
+      pdf.text(`${allDots.length} dots`, 3, heightMm + captionMm - 2);
       pdf.save("dot-art.pdf");
     };
     img.onerror = () => URL.revokeObjectURL(url);
     img.src = url;
-  }, [dots, canvasPxW, canvasPxH, pxPerUnit, unit, canvasBg, gridColor, gridOpacity, gridThickness, canvasPhysW, canvasPhysH, dotShape]);
+  }, [layers, canvasPxW, canvasPxH, pxPerUnit, unit, canvasBg, gridColor, gridOpacity, gridThickness, canvasPhysW, canvasPhysH, dotShape]);
 
   // ── Editable project: serialize / save / open / restore ──
   const fileInputRef = useRef<HTMLInputElement>(null);
