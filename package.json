@@ -3,6 +3,13 @@
   "private": true,
   "version": "1.0.0",
   "type": "module",
+  "description": "A browser-based dot/bead-grid art editor inspired by the Tangaliya weaving craft of Saurashtra, Gujarat.",
+  "license": "MIT",
+  "author": "Piyush",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Cygnusx-09/Tangaliya.git"
+  },
   "scripts": {
     "build": "vite build",
     "dev": "vite"
