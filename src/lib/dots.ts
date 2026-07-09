@@ -1,7 +1,7 @@
 // Shared dot-grid model + image/text → dots conversion. Used by the main editor
 // (DotArtTool) and the standalone full-screen image tool. Pure, no React.
 
-export type SnapMode = "both" | "corner" | "center";
+export type SnapMode = "both" | "corner" | "center" | "fine";
 
 export interface Dot {
   key: string;
@@ -20,15 +20,23 @@ export function getKey(halfCol: number, halfRow: number) {
 
 // Enumerate EVERY snap point across the canvas. corner = even/even half-cells,
 // center = odd/odd, "both" = the full half-cell lattice.
+// Parity is judged from the CENTER of the canvas outward (the lattice point
+// nearest the center always counts as a corner): imported art is contain/cover-
+// fit around the center, so this keeps the dot pattern anchored there when the
+// grid resolution changes — otherwise a coarse lattice on an odd cell count has
+// no point at the center and the whole design wobbles, pinned to the top-left.
+// (Keys stay absolute half-cell indices, so editor import is unaffected. This
+// deliberately diverges from P5js sketch/grid.js, which is corner-anchored.)
 export function generateGridPoints(
   snapMode: SnapMode, canvasW: number, canvasH: number
 ): { key: string; x: number; y: number }[] {
   const pts: { key: string; x: number; y: number }[] = [];
   const maxHC = Math.round(canvasW / HALF_CELL);
   const maxHR = Math.round(canvasH / HALF_CELL);
+  const oc = Math.round(maxHC / 2), or = Math.round(maxHR / 2);
   for (let hc = 0; hc <= maxHC; hc++) {
     for (let hr = 0; hr <= maxHR; hr++) {
-      const cEven = hc % 2 === 0, rEven = hr % 2 === 0;
+      const cEven = (hc - oc) % 2 === 0, rEven = (hr - or) % 2 === 0;
       if (snapMode === "corner" && !(cEven && rEven)) continue;
       if (snapMode === "center" && !(!cEven && !rEven)) continue;
       pts.push({ key: getKey(hc, hr), x: hc * HALF_CELL, y: hr * HALF_CELL });
@@ -67,21 +75,29 @@ export function buildDotsFromImage(
   const out = new Map<string, Dot>();
   if (W <= 0 || H <= 0) return out;
 
+  // Sample on an AREA average, not a single pixel: downscale the cover-fit image
+  // once to the half-cell grid resolution (one texel per snap point) so the
+  // browser box-filters each cell. Kills aliasing/noise on downsampled photos —
+  // and the getImageData is tiny (grid-sized, not full raster) so it's faster too.
+  const sw = Math.round(W / HALF_CELL) + 1;   // half-cell columns (matches generateGridPoints bounds)
+  const sh = Math.round(H / HALF_CELL) + 1;   // half-cell rows
   const off = document.createElement("canvas");
-  off.width = W; off.height = H;
+  off.width = sw; off.height = sh;
   const ctx = off.getContext("2d", { willReadFrequently: true });
   if (!ctx) return out;
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = "high";
 
-  // Cover-fit (center-crop) so the image fills the canvas without stretching.
+  // Cover-fit (center-crop) so the image fills the grid without stretching.
   const iw = bitmap.width, ih = bitmap.height;
-  const scale = Math.max(W / iw, H / ih);
-  ctx.drawImage(bitmap, (W - iw * scale) / 2, (H - ih * scale) / 2, iw * scale, ih * scale);
-  const data = ctx.getImageData(0, 0, W, H).data;
+  const scale = Math.max(sw / iw, sh / ih);
+  ctx.drawImage(bitmap, (sw - iw * scale) / 2, (sh - ih * scale) / 2, iw * scale, ih * scale);
+  const data = ctx.getImageData(0, 0, sw, sh).data;
 
   for (const p of generateGridPoints(opts.snapMode, W, H)) {
-    const sx = Math.min(W - 1, Math.max(0, Math.round(p.x)));
-    const sy = Math.min(H - 1, Math.max(0, Math.round(p.y)));
-    const i = (sy * W + sx) * 4;
+    const sx = Math.min(sw - 1, Math.max(0, Math.round(p.x / HALF_CELL)));
+    const sy = Math.min(sh - 1, Math.max(0, Math.round(p.y / HALF_CELL)));
+    const i = (sy * sw + sx) * 4;
     const r = data[i], g = data[i + 1], b = data[i + 2];
     const lum = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255;
     if (opts.style === "tonal") {
@@ -107,81 +123,93 @@ export function hash01(x: number, y: number): number {
   return ((h ^ (h >>> 16)) >>> 0) / 4294967295;
 }
 
-// Rasterized text → dots with a halftone DISSOLVE: dots are solid inside the
-// letters and shrink + scatter outward at the edges. The scatter is a coverage
-// field (text alpha, box-averaged on the half-cell lattice) blurred outward;
-// each grid point is placed by probability and sized by that field. Dots stay
-// on the lattice (deterministic hash) so they remain snapped/editable. Pure.
+// Rasterized text → dots with a halftone DISSOLVE: a coverage field (text
+// alpha, box-averaged on the half-cell lattice) is blurred outward (optionally
+// direction-biased — `drift`) and every grid point gets a dot SIZED by the
+// field: full in the letter core (with subtle texture), shrinking smoothly to
+// sub-pixel through the fringe. Dots stay on the lattice so they remain
+// snapped/editable. Pure.
 export function buildDotsFromText(
   src: CanvasImageSource & { width: number; height: number }, w: number, h: number,
-  opts: { style: "color" | "mono" | "tonal"; threshold: number; dotRadius: number; snapMode: SnapMode; textColor: string; monoColor: string; scatter: number }
+  opts: { style: "color" | "mono" | "tonal"; threshold: number; dotRadius: number; snapMode: SnapMode; textColor: string; monoColor: string; scatter: number; drift?: number; driftAngle?: number }
 ): Map<string, Dot> {
   const W = Math.round(w), H = Math.round(h);
   const out = new Map<string, Dot>();
   if (W <= 0 || H <= 0) return out;
 
+  // Coverage field on the half-cell lattice. The text is downsampled straight
+  // to lattice resolution (one texel per snap point; the browser box-filters
+  // the drawImage) instead of reading the full raster — a full-res getImageData
+  // dominated rebuild cost and stalled live slider scrubs/recording. The -0.5
+  // texel shift centers each texel on its lattice point.
+  const cols = Math.round(W / HALF_CELL) + 1;
+  const rows = Math.round(H / HALF_CELL) + 1;
   const off = document.createElement("canvas");
-  off.width = W; off.height = H;
+  off.width = cols; off.height = rows;
   const ctx = off.getContext("2d", { willReadFrequently: true });
   if (!ctx) return out;
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = "high";
 
   // Contain-fit (aspect already matches the canvas, so this fills without crop).
   const iw = src.width, ih = src.height;
   const s = Math.min(W / iw, H / ih);
-  ctx.drawImage(src, (W - iw * s) / 2, (H - ih * s) / 2, iw * s, ih * s);
-  const data = ctx.getImageData(0, 0, W, H).data;
-
-  // Coverage field on the full half-cell lattice: average text alpha over a
-  // cell-sized box around each lattice point.
-  const cols = Math.round(W / HALF_CELL) + 1;
-  const rows = Math.round(H / HALF_CELL) + 1;
+  ctx.drawImage(src,
+    ((W - iw * s) / 2) / HALF_CELL - 0.5, ((H - ih * s) / 2) / HALF_CELL - 0.5,
+    (iw * s) / HALF_CELL, (ih * s) / HALF_CELL);
+  const data = ctx.getImageData(0, 0, cols, rows).data;
   const field = new Float32Array(cols * rows);
-  const rad = Math.max(1, Math.round(HALF_CELL / 2));
-  for (let c = 0; c < cols; c++) {
-    for (let rW = 0; rW < rows; rW++) {
-      const px = c * HALF_CELL, py = rW * HALF_CELL;
-      let sum = 0, n = 0;
-      for (let dx = -rad; dx <= rad; dx += 2) {
-        for (let dy = -rad; dy <= rad; dy += 2) {
-          const sx = px + dx, sy = py + dy;
-          if (sx < 0 || sy < 0 || sx >= W || sy >= H) continue;
-          sum += data[(sy * W + sx) * 4 + 3]; n++;       // alpha
-        }
-      }
-      field[c * rows + rW] = n ? sum / (n * 255) : 0;
-    }
-  }
+  for (let c = 0; c < cols; c++)
+    for (let rW = 0; rW < rows; rW++)
+      field[c * rows + rW] = data[(rW * cols + c) * 4 + 3] / 255;   // alpha
 
-  // Blur outward `scatter` passes (neighbour average) → the dissolve halo.
+  // Blur outward `scatter` passes → the dissolve halo. `drift` (0..1) biases
+  // the kernel toward the upstream neighbour so coverage pours downstream and
+  // the halo smears in one direction (`driftAngle` in degrees, 0 = right,
+  // screen y-down, so 135 = down-left).
   let buf = field;
   const passes = Math.round(scatterToPasses(opts.scatter));
+  const drift = Math.min(1, Math.max(0, opts.drift ?? 0));
+  const ang = ((opts.driftAngle ?? 135) * Math.PI) / 180;
+  const ux = Math.cos(ang), uy = Math.sin(ang);
+  const w9: number[] = [];
+  for (let dc = -1; dc <= 1; dc++) for (let dr = -1; dr <= 1; dr++) {
+    const len = Math.hypot(dc, dr);
+    w9.push(len ? Math.max(0, 1 - drift * ((dc * ux + dr * uy) / len)) : 1);
+  }
   for (let p = 0; p < passes; p++) {
     const nb = new Float32Array(cols * rows);
     for (let c = 0; c < cols; c++) for (let rW = 0; rW < rows; rW++) {
-      let sum = 0, n = 0;
-      for (let dc = -1; dc <= 1; dc++) for (let dr = -1; dr <= 1; dr++) {
+      let sum = 0, wsum = 0, k = 0;
+      for (let dc = -1; dc <= 1; dc++) for (let dr = -1; dr <= 1; dr++, k++) {
         const cc = c + dc, rr = rW + dr;
         if (cc < 0 || rr < 0 || cc >= cols || rr >= rows) continue;
-        sum += buf[cc * rows + rr]; n++;
+        sum += buf[cc * rows + rr] * w9[k];
+        wsum += w9[k];
       }
-      nb[c * rows + rW] = sum / n;
+      nb[c * rows + rW] = wsum ? sum / wsum : 0;
     }
     buf = nb;
   }
 
-  const SIZE_GAMMA = 1.6, MIN_DOT = 0.12;
   const CORE = 0.6, low = 0.04 + opts.threshold * 0.5;   // density slider lifts the floor
+  const MIN_PX = 0.3;                                     // cull sub-pixel dots
   for (const pt of generateGridPoints(opts.snapMode, W, H)) {
     const c = Math.round(pt.x / HALF_CELL), rW = Math.round(pt.y / HALF_CELL);
     const f = buf[c * rows + rW] || 0;
     if (f <= low) continue;
     let radius: number;
     if (f >= CORE) {
-      radius = opts.dotRadius;                            // solid letter core
+      // subtle halftone texture inside the letters (thin strokes → smaller dots)
+      radius = opts.dotRadius * (0.85 + 0.15 * (f - CORE) / (1 - CORE));
     } else {
+      // Size-graded fringe: dots stay DENSE and shrink smoothly outward (no
+      // probabilistic dropout — that read as noise, not halftone). A mild
+      // per-dot size jitter keeps it organic; the sub-pixel cull lets the
+      // outermost tail go naturally grainy.
       const t = (f - low) / (CORE - low);                // 0..1 across the fringe
-      if (hash01(c, rW) > t) continue;                   // probabilistic scatter
-      radius = opts.dotRadius * (MIN_DOT + (1 - MIN_DOT) * t);
+      radius = opts.dotRadius * Math.pow(t, 0.9) * (0.75 + 0.5 * hash01(c, rW));
+      if (radius < MIN_PX) continue;
     }
     const color = opts.style === "tonal"
       ? (() => { const g = Math.round((1 - Math.min(1, f)) * 255); return rgbToHex(g, g, g); })()
@@ -191,9 +219,10 @@ export function buildDotsFromText(
   return out;
 }
 
-// Scatter slider (0..1) → blur passes (0..10). Wider = softer dissolve.
+// Scatter slider (0..1) → blur passes (0..22). Wider = softer + longer dissolve
+// tails (each pass spreads the coverage field one half-cell outward).
 export function scatterToPasses(scatter: number): number {
-  return Math.max(0, Math.min(10, scatter * 10));
+  return Math.max(0, Math.min(22, scatter * 22));
 }
 
 // Rasterize multi-line text (white on transparent) onto a tight canvas, in the
