@@ -274,6 +274,7 @@ export function DotArtTool() {
   const [redoCount, setRedoCount] = useState(0);
   const [color, setColor] = useState(boot?.color ?? "#FF2A2A");
   const [recentColors, setRecentColors] = useState<string[]>(boot?.recentColors ?? []);
+  const [paletteOpen, setPaletteOpen] = useState(false); // Recent/Palette collapsible dropdown
   const [radius, setRadius] = useState(boot?.radius ?? 1);
   // Dot render shape — global (all dots), snapping unaffected. Persisted.
   const [dotShape, setDotShape] = useState<DotShape>(() => {
@@ -2820,6 +2821,12 @@ export function DotArtTool() {
             </div>
           </div>
 
+          {/* Dot Size — moved here from the color context panel (2026-07-09) */}
+          <ValueSlider label="Dot Size" min={1} max={14}
+            value={colorMixed ? 7 : activeRadius}
+            display={colorMixed ? "—" : `${activeRadius}`}
+            onChange={setActiveRadius} />
+
           {/* Elements — pick what the right panel edits */}
           <div>
             <div className="text-[14px] text-[var(--txt-2)] tracking-[-0.3px] mb-2">Elements</div>
@@ -3391,31 +3398,41 @@ export function DotArtTool() {
                 </label>
               </div>
 
-              {recentColors.length > 0 && (
-                <div className="bg-[var(--ctl)] rounded-xl p-3">
-                  <div className="text-[15px] text-[var(--txt-1)] mb-2">Recent</div>
-                  <div className="flex flex-wrap gap-2">
-                    {recentColors.map((c) => (
-                      <button key={c} onClick={() => chooseColor(c)} title={c.toUpperCase()}
-                        className="w-9 h-9 rounded-lg transition-all hover:scale-105 active:scale-95"
-                        style={{ backgroundColor: c, border: "1px solid rgba(0,0,0,0.1)" }} />
-                    ))}
+              <div className="bg-[var(--ctl)] rounded-xl overflow-hidden">
+                <button onClick={() => setPaletteOpen((o) => !o)}
+                  className="w-full flex items-center justify-between p-3 text-[15px] text-[var(--txt-1)]">
+                  Recent &amp; Palette
+                  {paletteOpen ? <ChevronUp size={16} /> : <ChevronDown size={16} />}
+                </button>
+                {paletteOpen && (
+                  <div className="p-3 pt-0 flex flex-col gap-3">
+                    {recentColors.length > 0 && (
+                      <div>
+                        <div className="text-[13px] text-[var(--txt-3)] mb-2">Recent</div>
+                        <div className="flex flex-wrap gap-2">
+                          {recentColors.map((c) => (
+                            <button key={c} onClick={() => chooseColor(c)} title={c.toUpperCase()}
+                              className="w-9 h-9 rounded-lg transition-all hover:scale-105 active:scale-95"
+                              style={{ backgroundColor: c, border: "1px solid rgba(0,0,0,0.1)" }} />
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                    <div>
+                      <div className="text-[13px] text-[var(--txt-3)] mb-2">Palette</div>
+                      <div className="grid grid-cols-5 gap-2">
+                        {PALETTE.map((c) => {
+                          const isActive = !colorMixed && activeColor.toLowerCase() === c.toLowerCase();
+                          return (
+                            <button key={c} onClick={() => chooseColor(c)} title={c.toUpperCase()}
+                              className="aspect-square rounded-lg transition-all hover:scale-105 active:scale-95"
+                              style={{ backgroundColor: c, outline: isActive ? "2.5px solid var(--solid)" : "1px solid rgba(0,0,0,0.1)", outlineOffset: "1px" }} />
+                          );
+                        })}
+                      </div>
+                    </div>
                   </div>
-                </div>
-              )}
-
-              <div className="bg-[var(--ctl)] rounded-xl p-3">
-                <div className="text-[15px] text-[var(--txt-1)] mb-2">Palette</div>
-                <div className="grid grid-cols-5 gap-2">
-                  {PALETTE.map((c) => {
-                    const isActive = !colorMixed && activeColor.toLowerCase() === c.toLowerCase();
-                    return (
-                      <button key={c} onClick={() => chooseColor(c)} title={c.toUpperCase()}
-                        className="aspect-square rounded-lg transition-all hover:scale-105 active:scale-95"
-                        style={{ backgroundColor: c, outline: isActive ? "2.5px solid var(--solid)" : "1px solid rgba(0,0,0,0.1)", outlineOffset: "1px" }} />
-                    );
-                  })}
-                </div>
+                )}
               </div>
 
               <button onClick={shuffleColors} title="Random background + grid + brush combination"
@@ -3424,10 +3441,6 @@ export function DotArtTool() {
                 Shuffle colors
               </button>
 
-              <ValueSlider label="Dot Size" min={1} max={14}
-                value={colorMixed ? 7 : activeRadius}
-                display={colorMixed ? "—" : `${activeRadius}`}
-                onChange={setActiveRadius} />
               {tool === "draw" && (
                 <ValueSlider label="Snap reach" min={10} max={70} step={5}
                   value={snapReach} display={`${snapReach}%`}
