@@ -183,6 +183,36 @@
   }
 }
 
+/* Layer-nav feedback (canvas up/down arrows): a one-shot opacity pulse on the
+   layer you just switched to (see DotLayer in DotArtTool.tsx — remounted via
+   a bumped key so the animation replays each switch), and a small toast
+   sliding in from the direction of travel with its name. */
+@keyframes dotart-layer-pulse {
+  0% { opacity: 1; }
+  50% { opacity: 0.55; }
+  100% { opacity: 1; }
+}
+.dotart-layer-pulse {
+  animation: dotart-layer-pulse 250ms ease-in-out;
+}
+
+@keyframes dotart-layer-toast {
+  0% { opacity: 0; transform: translateY(var(--ty, 8px)); }
+  15% { opacity: 1; transform: translateY(0); }
+  82% { opacity: 1; transform: translateY(0); }
+  100% { opacity: 0; transform: translateY(0); }
+}
+.dotart-layer-toast {
+  animation: dotart-layer-toast 900ms ease-out both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .dotart-layer-pulse,
+  .dotart-layer-toast {
+    animation: none;
+  }
+}
+
 @layer base {
   * {
     @apply border-border outline-ring/50;
