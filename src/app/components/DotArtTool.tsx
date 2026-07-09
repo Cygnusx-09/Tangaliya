@@ -274,7 +274,7 @@ export function DotArtTool() {
   const [redoCount, setRedoCount] = useState(0);
   const [color, setColor] = useState(boot?.color ?? "#FF2A2A");
   const [recentColors, setRecentColors] = useState<string[]>(boot?.recentColors ?? []);
-  const [radius, setRadius] = useState(boot?.radius ?? 3);
+  const [radius, setRadius] = useState(boot?.radius ?? 1);
   // Dot render shape — global (all dots), snapping unaffected. Persisted.
   const [dotShape, setDotShape] = useState<DotShape>(() => {
     try { return localStorage.getItem("tangaliya-dot-shape") === "bar" ? "bar" : "circle"; } catch { return "circle"; }
@@ -289,7 +289,7 @@ export function DotArtTool() {
   // draw dot radius (resizing the eraser must not change the brush).
   const [eraseRadius, setEraseRadius] = useState(boot?.eraseRadius ?? 8);
   const [tool, setTool] = useState<Tool>("draw");
-  const [snapMode, setSnapMode] = useState<SnapMode>(boot?.snapMode ?? "both");
+  const [snapMode, setSnapMode] = useState<SnapMode>(boot?.snapMode ?? "fine");
   // Image import: a modal tunes the conversion; "Add to canvas" commits the dots.
   // These aren't part of the saved scene — they only configure the conversion.
   const [importOpen, setImportOpen] = useState(false);
@@ -324,13 +324,13 @@ export function DotArtTool() {
   const [gridThickness, setGridThickness] = useState(boot?.gridThickness ?? 0.5);
 
   // ── Universal unit (project-wide) ──
-  const [unit, setUnit] = useState<Unit>(boot?.unit ?? "mm");
-  const [cellPhysical, setCellPhysical] = useState(boot?.cellPhysical ?? 10);   // value expressed in current `unit`
-  const [canvasPhysW, setCanvasPhysW] = useState(boot?.canvasPhysW ?? 200);
-  const [canvasPhysH, setCanvasPhysH] = useState(boot?.canvasPhysH ?? 150);
-  const [cellInput, setCellInput] = useState(String(boot?.cellPhysical ?? 10));
-  const [wInput, setWInput] = useState(String(boot?.canvasPhysW ?? 200));
-  const [hInput, setHInput] = useState(String(boot?.canvasPhysH ?? 150));
+  const [unit, setUnit] = useState<Unit>(boot?.unit ?? "cm");
+  const [cellPhysical, setCellPhysical] = useState(boot?.cellPhysical ?? 1);   // value expressed in current `unit`
+  const [canvasPhysW, setCanvasPhysW] = useState(boot?.canvasPhysW ?? 20);
+  const [canvasPhysH, setCanvasPhysH] = useState(boot?.canvasPhysH ?? 20);
+  const [cellInput, setCellInput] = useState(String(boot?.cellPhysical ?? 1));
+  const [wInput, setWInput] = useState(String(boot?.canvasPhysW ?? 20));
+  const [hInput, setHInput] = useState(String(boot?.canvasPhysH ?? 20));
 
   const [dark, setDark] = useState<boolean>(() => {
     try { return localStorage.getItem("tangaliya-theme") === "dark"; } catch { return false; }
@@ -1002,7 +1002,15 @@ export function DotArtTool() {
     try { const m = localStorage.getItem("tangaliya-line-shape"); return m === "ramp" || m === "taper" || m === "pulse" ? m : "even"; } catch { return "even"; }
   });
   const [lineAmount, setLineAmount] = useState<number>(() => {
-    try { const v = Number(localStorage.getItem("tangaliya-line-amount")); return Number.isFinite(v) ? v : 50; } catch { return 50; }
+    // localStorage.getItem returns null when unset, and Number(null) === 0
+    // (not NaN) — so a plain Number.isFinite check can never fall through to
+    // the default for a fresh browser. Check for "unset" explicitly first.
+    try {
+      const raw = localStorage.getItem("tangaliya-line-amount");
+      if (raw === null) return 100;
+      const v = Number(raw);
+      return Number.isFinite(v) ? v : 100;
+    } catch { return 100; }
   });
   const [lineCount, setLineCount] = useState<number>(() => {
     try { return Number(localStorage.getItem("tangaliya-line-count")) || 3; } catch { return 3; }
