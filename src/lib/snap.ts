@@ -1,5 +1,4 @@
-// snap.ts — the half-cell/sub-grid snap lattice math, extracted verbatim from
-// DotArtTool.tsx (module scope, no React/ref coupling — see ARCHITECTURE.md).
+// snap.ts — the half-cell/sub-grid snap lattice math. Pure, no React.
 
 import { CELL_SIZE, HALF_CELL, getKey, GRID_SUBDIV, FINE_CELL, getFineKey, type SnapMode } from "@/lib/dots";
 
@@ -13,6 +12,74 @@ export { GRID_SUBDIV, FINE_CELL, getFineKey };
 // The lattice step size a given snap mode places/moves dots on.
 export function snapSpacing(mode: SnapMode): number {
   return mode === "fine" ? FINE_CELL : mode === "both" ? HALF_CELL : CELL_SIZE;
+}
+
+// Absolute minimum-distance gate: true if (x,y) is at least minDistPx away
+// from every dot already in `dots`. Used to enforce the global "Min. Spacing"
+// setting across every placement path (draw, brush walk, line/pen/shape,
+// hand-draw) regardless of which snap mode or spacing model produced the
+// candidate point.
+export function farEnough(x: number, y: number, dots: Map<string, { x: number; y: number }>, minDistPx: number): boolean {
+  if (minDistPx <= 0) return true;
+  for (const d of dots.values()) {
+    if (Math.hypot(d.x - x, d.y - y) < minDistPx) return false;
+  }
+  return true;
+}
+
+// Same greedy "first dot wins" rule as farEnough (raster scan order, since
+// Map iteration = insertion order = the grid's own scan order), but bucketed
+// into a spatial hash instead of a brute O(n²) scan — a bulk image import at
+// fine detail can produce 10^5-10^6 candidate dots, where farEnough's linear
+// scan per candidate would be far too slow for a live-scrubbed preview.
+export function filterMinSpacing<T extends { x: number; y: number }>(dots: Map<string, T>, minDistPx: number): Map<string, T> {
+  if (minDistPx <= 0) return dots;
+  const cell = minDistPx;
+  const buckets = new Map<string, { x: number; y: number }[]>();
+  const out = new Map<string, T>();
+  for (const [key, dot] of dots) {
+    const bx = Math.floor(dot.x / cell), by = Math.floor(dot.y / cell);
+    let clear = true;
+    for (let dx = -1; dx <= 1 && clear; dx++) {
+      for (let dy = -1; dy <= 1; dy++) {
+        const bucket = buckets.get(`${bx + dx},${by + dy}`);
+        if (!bucket) continue;
+        if (bucket.some((p) => Math.hypot(p.x - dot.x, p.y - dot.y) < minDistPx)) { clear = false; break; }
+      }
+    }
+    if (!clear) continue;
+    out.set(key, dot);
+    const bk = `${bx},${by}`;
+    const bucket = buckets.get(bk);
+    if (bucket) bucket.push(dot); else buckets.set(bk, [dot]);
+  }
+  return out;
+}
+
+// Canvas-bounds gate (edges inclusive — x = 0 and x = canvasW are real snap
+// points). getNearestSnap and computePathDots enforce this internally; the
+// paths that place via the unbounded keyFromPosition (array, paste) gate
+// through this instead.
+export function inBounds(x: number, y: number, canvasW: number, canvasH: number): boolean {
+  return x >= 0 && x <= canvasW && y >= 0 && y <= canvasH;
+}
+
+// Clamp a lattice-aligned move offset (drag / arrow-nudge) so the selection's
+// bounding box stays inside the canvas — the selection stops flush at the
+// wall as a unit instead of dots leaking past the edge. Clamps in whole
+// `spacing` steps so the result stays lattice-aligned, and never forces a
+// move: if the selection already pokes outside (legacy data), staying put is
+// always allowed.
+export function clampOffsetToCanvas(
+  dx: number, dy: number,
+  bbox: { minX: number; minY: number; maxX: number; maxY: number },
+  canvasW: number, canvasH: number, spacing: number
+): { dx: number; dy: number } {
+  const dxMin = Math.min(0, -Math.floor(bbox.minX / spacing) * spacing);
+  const dxMax = Math.max(0, Math.floor((canvasW - bbox.maxX) / spacing) * spacing);
+  const dyMin = Math.min(0, -Math.floor(bbox.minY / spacing) * spacing);
+  const dyMax = Math.max(0, Math.floor((canvasH - bbox.maxY) / spacing) * spacing);
+  return { dx: Math.min(dxMax, Math.max(dxMin, dx)), dy: Math.min(dyMax, Math.max(dyMin, dy)) };
 }
 
 export function getNearestSnap(

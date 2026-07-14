@@ -18,17 +18,22 @@ which loads from a CDN at runtime and needs a secure context
 
 ## Before you open a PR
 
-There is **no automated test suite**. Verification is:
+Verification is:
 
-1. `npm run typecheck` must pass. This is the one static safety net the
-   project has — it specifically catches a recurring crash class (a
-   `useEffect`/`useCallback` dependency array referencing something declared
-   later in the file). See [`ARCHITECTURE.md`](./ARCHITECTURE.md#the-state-vs-ref-mirroring-pattern--read-this-before-touching-handlers)
+1. `npm run typecheck` must pass. This is the static safety net — it
+   specifically catches a recurring crash class (a `useEffect`/`useCallback`
+   dependency array referencing something declared later in the file). See
+   [`ARCHITECTURE.md`](./ARCHITECTURE.md#the-state-vs-ref-mirroring-pattern--read-this-before-touching-handlers)
    for why this matters before you touch any handler.
 2. `npm run build` must succeed.
-3. Manually exercise the change in the browser. At minimum, run through
-   **SMOKE-QUICK** below; if your change touches drawing, tools, layers, or
-   export, run **SMOKE-FULL**.
+3. `npm run smoke` must pass — an automated browser smoke suite
+   (`tests/smoke.mjs`, Playwright driving your installed Chrome headlessly).
+   It spawns its own Vite on port 5199 and uses a fresh browser profile, so
+   it won't disturb a dev server you have open or your autosaved project.
+4. Manually exercise the change in the browser for anything the script can't
+   judge (visual correctness, feel). At minimum, run through **SMOKE-QUICK**
+   below; if your change touches drawing, tools, layers, or export, run
+   **SMOKE-FULL**.
 
 ### SMOKE-QUICK (~2 min)
 

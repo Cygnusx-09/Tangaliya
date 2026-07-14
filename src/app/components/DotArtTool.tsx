@@ -1,13 +1,15 @@
 import { useState, useRef, useCallback, useEffect, useMemo, memo } from "react";
 import { HexColorPicker } from "react-colorful";
-import { Eraser, Pen, Trash2, ZoomIn, ZoomOut, Maximize2, Undo2, Redo2, MousePointer2, FileImage, FileCode2, Printer, Grid3x3, Magnet, Ruler, Plus, Minus, Droplet, PaintBucket, Moon, Sun, Volume2, VolumeX, Hand, GripHorizontal, Menu, SlidersHorizontal, Dices, Save, FolderOpen, ImagePlus, Type, FlipHorizontal2, FlipVertical2, Slash, PenTool, Circle, Layers as LayersIcon, Eye, EyeOff, Copy, ChevronUp, ChevronDown } from "lucide-react";
+import { Eraser, Pen, Trash2, ZoomIn, ZoomOut, Maximize2, Undo2, Redo2, MousePointer2, FileImage, FileCode2, Printer, Grid3x3, Magnet, Ruler, Plus, Minus, Droplet, PaintBucket, Moon, Sun, Volume2, VolumeX, Hand, GripHorizontal, Menu, SlidersHorizontal, Dices, Save, FolderOpen, ImagePlus, Type, FlipHorizontal2, FlipVertical2, Slash, PenTool, Circle, Layers as LayersIcon, Eye, EyeOff, Copy, ChevronUp, ChevronDown, Repeat } from "lucide-react";
 import { sfx, setSfxMuted } from "../sounds";
 import { Progress } from "./ui/progress";
 import {
-  CELL_SIZE, HALF_CELL, getKey, generateGridPoints, rgbToHex, computeImportDims,
+  CELL_SIZE, HALF_CELL, getKey, generateGridPoints, rgbToHex, computeImportDims, computeCanvasDims,
   buildDotsFromImage, buildDotsFromText, renderTextCanvas, type SnapMode, type Dot,
 } from "@/lib/dots";
-import { GRID_SUBDIV, FINE_CELL, getFineKey, snapSpacing, getNearestSnap, mirrorSnaps, keyFromPosition } from "@/lib/snap";
+import { buildPaletteDots } from "@/lib/palette";
+import { GRID_SUBDIV, FINE_CELL, getFineKey, snapSpacing, getNearestSnap, mirrorSnaps, keyFromPosition, farEnough, filterMinSpacing, inBounds, clampOffsetToCanvas } from "@/lib/snap";
+import { downloadBlob } from "@/lib/download";
 import {
   constrainAngle15, pathPolyline, computePathDots,
   type SpacingShape, type SpacingOpts,
@@ -17,15 +19,19 @@ import {
   type DotShape, type ShapeKind,
 } from "@/lib/shapes";
 import {
-  PROJECT_VERSION, AUTOSAVE_KEY, PROJECT_TAG, genLayerId, parseScene, sceneToLayers, flattenLayers,
+  motifPivot, computeLinearInstances, computeGridInstances, computeCurveInstances, computeArrayPlacements,
+  type ArrayMode, type Transform,
+} from "@/lib/array";
+import {
+  PROJECT_VERSION, AUTOSAVE_KEY, PROJECT_TAG, parseScene, sceneToLayers, flattenLayers,
   convertUnit, roundForUnit, fmt, buildSVGString,
-  type Unit, type Layer, type UndoSnapshot, type SceneFile,
+  type Unit, type Layer, type SceneFile,
 } from "@/lib/scene";
+import { useLayers } from "../hooks/useLayers";
 
-type Tool = "draw" | "erase" | "select" | "line" | "pen" | "shape";
+type Tool = "draw" | "erase" | "select" | "line" | "pen" | "shape" | "array";
 const MIN_ZOOM = 0.1;
 const MAX_ZOOM = 20;
-const MAX_UNDO = 60;
 
 // One layer's dots rendered as a single memoized SVG group. Pointermove-driven
 // state (hover, draw preview, drag) re-renders DotArtTool on every mouse move;
@@ -129,6 +135,18 @@ function findDotAt(dots: Map<string, Dot>, wx: number, wy: number): Dot | null {
     if (d <= dot.radius + 4 && d < closestDist) { closest = dot; closestDist = d; }
   }
   return closest;
+}
+
+// Bounding box of the selected dots' centers — null when nothing resolves.
+function selectionBBox(dots: Map<string, Dot>, keys: Set<string>): { minX: number; minY: number; maxX: number; maxY: number } | null {
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const k of keys) {
+    const d = dots.get(k);
+    if (!d) continue;
+    if (d.x < minX) minX = d.x; if (d.x > maxX) maxX = d.x;
+    if (d.y < minY) minY = d.y; if (d.y > maxY) maxY = d.y;
+  }
+  return maxX === -Infinity ? null : { minX, minY, maxX, maxY };
 }
 
 function dotsInRect(dots: Map<string, Dot>, wx1: number, wy1: number, wx2: number, wy2: number): Set<string> {
@@ -243,25 +261,24 @@ export function DotArtTool() {
   }
   const boot = bootRef.current;
 
-  // ── Layers ──
-  // The stack is the source of truth; `dots`/`setDots` below are thin shims
-  // over the ACTIVE layer, so every existing tool / undo / selection path keeps
-  // editing "the dots" with no change — it just lands in the active layer.
-  const initLayersRef = useRef<Layer[] | null>(null);
-  if (initLayersRef.current === null) initLayersRef.current = sceneToLayers(boot);
-  const [layers, setLayers] = useState<Layer[]>(() => initLayersRef.current!);
-  const [activeLayerId, setActiveLayerId] = useState<string>(() => initLayersRef.current![initLayersRef.current!.length - 1].id);
-  const activeLayerIdRef = useRef(activeLayerId);
-  useEffect(() => { activeLayerIdRef.current = activeLayerId; }, [activeLayerId]);
-  const layersRef = useRef(layers);
-  useEffect(() => { layersRef.current = layers; }, [layers]);
-  const activeLayer = layers.find((l) => l.id === activeLayerId) ?? layers[0];
-  const dots = activeLayer.dots;
-  const setDots = useCallback((u: Map<string, Dot> | ((prev: Map<string, Dot>) => Map<string, Dot>)) => {
-    setLayers((ls) => ls.map((l) => l.id === activeLayerIdRef.current
-      ? { ...l, dots: typeof u === "function" ? (u as (p: Map<string, Dot>) => Map<string, Dot>)(l.dots) : u }
-      : l));
+  // ── Selection state + Layers ──
+  // Selection is declared before the layers hook because layer switches
+  // (select/add/delete, undo/redo landing on another layer) must clear it —
+  // the keys belong to the previous layer's dots.
+  const [selectedKeys, setSelectedKeys] = useState<Set<string>>(new Set());
+  const selectedKeysRef = useRef<Set<string>>(new Set());
+  const clearSelection = useCallback(() => {
+    setSelectedKeys(new Set());
+    selectedKeysRef.current = new Set();
   }, []);
+  const {
+    layers, setLayers, layersRef,
+    activeLayerId, setActiveLayerId, activeLayerIdRef,
+    activeLayer, dots, setDots, dotsRef,
+    undoCount, redoCount, pushUndo, undo, redo,
+    selectLayer, addLayer, duplicateLayer, deleteLayer,
+    moveLayer, toggleLayerVisible, renameLayer,
+  } = useLayers(boot, clearSelection);
   const [showLayers, setShowLayers] = useState(false);
   // Canvas layer-nav arrows (up = layer above, down = layer below). pulseKey
   // bumps on every arrow switch so the newly-active DotLayer replays its
@@ -270,8 +287,6 @@ export function DotArtTool() {
   const [layerToast, setLayerToast] = useState<{ name: string; dir: 1 | -1; id: number } | null>(null);
   const layerToastTimerRef = useRef<number>();
 
-  const [undoCount, setUndoCount] = useState(0);
-  const [redoCount, setRedoCount] = useState(0);
   const [color, setColor] = useState(boot?.color ?? "#FF2A2A");
   const [recentColors, setRecentColors] = useState<string[]>(boot?.recentColors ?? []);
   const [paletteOpen, setPaletteOpen] = useState(false); // Recent/Palette collapsible dropdown
@@ -283,6 +298,12 @@ export function DotArtTool() {
   useEffect(() => {
     try { localStorage.setItem("tangaliya-dot-shape", dotShape); } catch { /* ignore */ }
   }, [dotShape]);
+  // Absolute minimum distance between any two dots, in subgrid units — a hard
+  // floor applied to every placement path (draw click, brush walk, line/pen/
+  // shape commit, hand-draw), independent of snap mode and of the Line/Pen
+  // Spacing model's own density curve. 1 = no-op (already the finest lattice
+  // step); only thins placement once it exceeds the active mode's own spacing.
+  const [minSpacing, setMinSpacing] = useState(boot?.minSpacing ?? 1);
   // Stroke snap reach, % of a lattice step: how far away a point "catches"
   // the pen during a stroke. High = eager/loose, low = deliberate placement.
   const [snapReach, setSnapReach] = useState(boot?.snapReach ?? 35);
@@ -294,6 +315,10 @@ export function DotArtTool() {
   // Image import: a modal tunes the conversion; "Add to canvas" commits the dots.
   // These aren't part of the saved scene — they only configure the conversion.
   const [importOpen, setImportOpen] = useState(false);
+  // Mirror of importOpen for the global keydown handler (Ctrl+V dot-paste
+  // needs to yield to the modal's own image-paste listener while it's open).
+  const importOpenRef = useRef(false);
+  useEffect(() => { importOpenRef.current = importOpen; }, [importOpen]);
   const [importImg, setImportImg] = useState<ImageBitmap | null>(null);
   const [traceStyle, setTraceStyle] = useState<"color" | "mono" | "tonal">("color");
   const [traceThreshold, setTraceThreshold] = useState(0.5);
@@ -301,6 +326,20 @@ export function DotArtTool() {
   const [traceDetail, setTraceDetail] = useState<SnapMode>("both"); // sub-cell fill
   const [importCell, setImportCell] = useState(10);             // cell size for the import (current unit)
   const [traceTonalColor, setTraceTonalColor] = useState(false); // Light & Shadow: keep image colors
+  // Image-modal-only style (Colors palette vs Light & Shadow tonal halftone) —
+  // separate from traceStyle, which the Text modal still uses (color/mono/tonal).
+  const [imgStyle, setImgStyle] = useState<"palette" | "tonal">("palette");
+  const [traceColorCount, setTraceColorCount] = useState(8);     // Colors slider, 1..32
+  // Manual swatch recolors, keyed by the ORIGINAL quantized hex (not slot
+  // index) so an edit survives a slider/threshold recompute as long as that
+  // hex reappears in the new quantization. Cleared only on modal open / new image.
+  const [paletteEdits, setPaletteEdits] = useState<Record<string, string>>({});
+  // Modal-local target canvas size (current unit) — seeded from the live
+  // canvas when the modal opens, only applied to the real canvas on commit.
+  const [importW, setImportW] = useState(20);
+  const [importH, setImportH] = useState(20);
+  const [importWInput, setImportWInput] = useState("20");
+  const [importHInput, setImportHInput] = useState("20");
   // Text → Dots mode (separate modal): typed text in an uploaded font, dissolved.
   const [textOpen, setTextOpen] = useState(false);
   const [textValue, setTextValue] = useState("Prompt them.\nStack them.\nShare them.");
@@ -384,7 +423,6 @@ export function DotArtTool() {
   // Which "element" the right-hand context panel is inspecting/editing.
   const [inspect, setInspect] = useState<"dot" | "grid" | "background">("dot");
 
-  const [selectedKeys, setSelectedKeys] = useState<Set<string>>(new Set());
   const [marqueeBox, setMarqueeBox] = useState<{ wx1: number; wy1: number; wx2: number; wy2: number } | null>(null);
   const [dragOffset, setDragOffset] = useState<{ dx: number; dy: number }>({ dx: 0, dy: 0 });
   const [hoveredDotKey, setHoveredDotKey] = useState<string | null>(null);
@@ -392,13 +430,9 @@ export function DotArtTool() {
   const zoomRef = useRef(1);
   const panRef = useRef({ x: 0, y: 0 });
   const rotRef = useRef(0);
-  const dotsRef = useRef<Map<string, Dot>>(new Map());
-  const undoStackRef = useRef<UndoSnapshot[]>([]);
-  const redoStackRef = useRef<UndoSnapshot[]>([]);
   const clipboardRef = useRef<Dot[]>([]);
   const pasteCountRef = useRef(0);
   const marqueeBaseRef = useRef<Set<string>>(new Set());
-  const selectedKeysRef = useRef<Set<string>>(new Set());
   const isPaintingRef = useRef(false);
   const isPanningRef = useRef(false);
   const isMarqueeingRef = useRef(false);
@@ -407,6 +441,9 @@ export function DotArtTool() {
   const marqueeStartRef = useRef<{ wx: number; wy: number } | null>(null);
   const dragStartWorldRef = useRef<{ x: number; y: number } | null>(null);
   const preDragDotsRef = useRef<Map<string, Dot>>(new Map());
+  // Selection bbox captured at drag start — the move handler clamps the drag
+  // offset against it so the selection stops flush at the canvas edge.
+  const dragBBoxRef = useRef<{ minX: number; minY: number; maxX: number; maxY: number } | null>(null);
   const snappedOffsetRef = useRef<{ dx: number; dy: number }>({ dx: 0, dy: 0 });
   const spaceDownRef = useRef(false);
   const toolRef = useRef<Tool>("draw");
@@ -414,19 +451,20 @@ export function DotArtTool() {
   const radiusRef = useRef(3);
   const snapReachRef = useRef(35);
   const eraseRadiusRef = useRef(8);
+  const minSpacingRef = useRef(1);
   const snapModeRef = useRef<SnapMode>("both");
   const canvasBoundsRef = useRef({ w: 0, h: 0 });
   const svgRef = useRef<SVGSVGElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const lastPickRef = useRef("#000000");
 
-  useEffect(() => { dotsRef.current = dots; }, [dots]);
   useEffect(() => { selectedKeysRef.current = selectedKeys; }, [selectedKeys]);
   useEffect(() => { toolRef.current = tool; }, [tool]);
   useEffect(() => { colorRef.current = color; }, [color]);
   useEffect(() => { radiusRef.current = radius; }, [radius]);
   useEffect(() => { snapReachRef.current = snapReach; }, [snapReach]);
   useEffect(() => { eraseRadiusRef.current = eraseRadius; }, [eraseRadius]);
+  useEffect(() => { minSpacingRef.current = minSpacing; }, [minSpacing]);
   useEffect(() => { snapModeRef.current = snapMode; }, [snapMode]);
 
   const pxPerUnit = CELL_SIZE / cellPhysical;
@@ -485,17 +523,6 @@ export function DotArtTool() {
       didInitialFitRef.current = true;
     }
   }, [viewportSize, fitToViewport]);
-
-  // Snapshot the active layer's dots onto the undo stack, tagged with which
-  // layer they belong to. Any new action invalidates redo.
-  const pushUndo = useCallback(() => {
-    const snapshot: UndoSnapshot = { layerId: activeLayerIdRef.current, dots: new Map(dotsRef.current) };
-    const newStack = [...undoStackRef.current.slice(-(MAX_UNDO - 1)), snapshot];
-    undoStackRef.current = newStack;
-    setUndoCount(newStack.length);
-    redoStackRef.current = [];
-    setRedoCount(0);
-  }, []);
 
   const pushRecentColor = useCallback((c: string) => {
     setRecentColors((prev) => [c, ...prev.filter((p) => p.toLowerCase() !== c.toLowerCase())].slice(0, 8));
@@ -560,68 +587,17 @@ export function DotArtTool() {
     });
   }, [pushUndo]);
 
-  // Undo/redo is one cross-layer timeline: a step can target a layer other
-  // than the currently active one (e.g. you drew on Layer A, switched to B and
-  // drew there, then undo twice — the 2nd undo must land back on A). Each step
-  // looks up its target layer's CURRENT dots (not dotsRef, which only mirrors
-  // whichever layer is active right now) to build the opposite stack's entry,
-  // writes the snapshot into that specific layer, and switches the active
-  // layer to it so the change is visible. If the target layer was deleted
-  // since the snapshot was taken (layer structure edits aren't undoable in
-  // v1), the step is dropped rather than misdirected into the wrong layer.
-  const undo = useCallback(() => {
-    if (undoStackRef.current.length === 0) return;
-    const popped = undoStackRef.current[undoStackRef.current.length - 1];
-    const targetLayer = layersRef.current.find((l) => l.id === popped.layerId);
-    if (!targetLayer) {
-      undoStackRef.current = undoStackRef.current.slice(0, -1);
-      setUndoCount(undoStackRef.current.length);
-      return;
-    }
-    sfx.undo();
-    redoStackRef.current = [...redoStackRef.current, { layerId: popped.layerId, dots: new Map(targetLayer.dots) }];
-    setRedoCount(redoStackRef.current.length);
-    undoStackRef.current = undoStackRef.current.slice(0, -1);
-    setUndoCount(undoStackRef.current.length);
-    const nextLayers = layersRef.current.map((l) => (l.id === popped.layerId ? { ...l, dots: popped.dots } : l));
-    setLayers(nextLayers); layersRef.current = nextLayers;
-    if (activeLayerIdRef.current !== popped.layerId) {
-      setActiveLayerId(popped.layerId); activeLayerIdRef.current = popped.layerId;
-      setSelectedKeys(new Set()); selectedKeysRef.current = new Set();
-    }
-    dotsRef.current = popped.dots;
-  }, []);
-
-  const redo = useCallback(() => {
-    if (redoStackRef.current.length === 0) return;
-    const popped = redoStackRef.current[redoStackRef.current.length - 1];
-    const targetLayer = layersRef.current.find((l) => l.id === popped.layerId);
-    if (!targetLayer) {
-      redoStackRef.current = redoStackRef.current.slice(0, -1);
-      setRedoCount(redoStackRef.current.length);
-      return;
-    }
-    sfx.redo();
-    undoStackRef.current = [...undoStackRef.current, { layerId: popped.layerId, dots: new Map(targetLayer.dots) }];
-    setUndoCount(undoStackRef.current.length);
-    redoStackRef.current = redoStackRef.current.slice(0, -1);
-    setRedoCount(redoStackRef.current.length);
-    const nextLayers = layersRef.current.map((l) => (l.id === popped.layerId ? { ...l, dots: popped.dots } : l));
-    setLayers(nextLayers); layersRef.current = nextLayers;
-    if (activeLayerIdRef.current !== popped.layerId) {
-      setActiveLayerId(popped.layerId); activeLayerIdRef.current = popped.layerId;
-      setSelectedKeys(new Set()); selectedKeysRef.current = new Set();
-    }
-    dotsRef.current = popped.dots;
-  }, []);
-
   // ── Selection operations (keyboard-driven) ──
   const deleteSelected = useCallback(() => {
     if (selectedKeysRef.current.size === 0) return;
     pushUndo();
+    // Snapshot the selection NOW: the functional updater below runs later (at
+    // render time), after this handler has already reset selectedKeysRef —
+    // reading the ref inside the updater would iterate an empty Set.
+    const keys = selectedKeysRef.current;
     setDots((prev) => {
       const next = new Map(prev);
-      for (const key of selectedKeysRef.current) next.delete(key);
+      for (const key of keys) next.delete(key);
       return next;
     });
     setSelectedKeys(new Set());
@@ -642,14 +618,38 @@ export function DotArtTool() {
     const next = new Map(dotsRef.current);
     const newSelected = new Set<string>();
     const spacing = snapSpacing(snapModeRef.current);
+    const { w, h } = canvasBoundsRef.current;
     for (const dot of source) {
       const pos = keyFromPosition(dot.x + dx, dot.y + dy, spacing);
+      if (!inBounds(pos.x, pos.y, w, h)) continue; // pasting near the edge drops what won't fit
       next.set(pos.key, { ...dot, key: pos.key, x: pos.x, y: pos.y });
       newSelected.add(pos.key);
     }
     dotsRef.current = next;
     setDots(next);
     setTool("select");
+    setSelectedKeys(newSelected);
+    selectedKeysRef.current = newSelected;
+  }, [pushUndo]);
+
+  // Array tool's commit — a sibling of placeDots, not a generalization of it
+  // (placeDots has two simple existing callers, duplicate/paste, with no
+  // rotation or min-spacing-gating need; changing its contract risks
+  // regressing those). `transforms` come from src/lib/array.ts's
+  // compute*Instances; computeArrayPlacements is the same pipeline the live
+  // preview already ran, so what was on screen is exactly what gets written.
+  const commitArrayDots = useCallback((motif: Dot[], transforms: Transform[]) => {
+    const spacing = snapSpacing(snapModeRef.current);
+    const minDist = minSpacingRef.current * FINE_CELL;
+    const placed = computeArrayPlacements(motif, transforms, dotsRef.current, spacing, minDist, canvasBoundsRef.current.w, canvasBoundsRef.current.h);
+    if (placed.size === 0) return; // everything gated out — no-op, don't burn an undo step
+    pushUndo();
+    const next = new Map(dotsRef.current);
+    for (const [k, d] of placed) next.set(k, d);
+    dotsRef.current = next;
+    setDots(next);
+    setTool("select");
+    const newSelected = new Set(placed.keys());
     setSelectedKeys(newSelected);
     selectedKeysRef.current = newSelected;
   }, [pushUndo]);
@@ -679,6 +679,11 @@ export function DotArtTool() {
 
   const nudgeSelected = useCallback((dx: number, dy: number) => {
     if (selectedKeysRef.current.size === 0) return;
+    const spacing = snapSpacing(snapModeRef.current);
+    // Stop flush at the canvas edge — the selection moves as a unit, no dot leaks out.
+    const bbox = selectionBBox(dotsRef.current, selectedKeysRef.current);
+    if (bbox) ({ dx, dy } = clampOffsetToCanvas(dx, dy, bbox, canvasBoundsRef.current.w, canvasBoundsRef.current.h, spacing));
+    if (dx === 0 && dy === 0) return;
     pushUndo();
     const base = new Map(dotsRef.current);
     const newSelected = new Set<string>();
@@ -687,7 +692,6 @@ export function DotArtTool() {
       if (!dot) continue;
       base.delete(key);
     }
-    const spacing = snapSpacing(snapModeRef.current);
     for (const key of selectedKeysRef.current) {
       const dot = dotsRef.current.get(key);
       if (!dot) continue;
@@ -746,7 +750,13 @@ export function DotArtTool() {
 
       if (mod && (e.key === "a" || e.key === "A")) { e.preventDefault(); selectAll(); return; }
       if (mod && (e.key === "c" || e.key === "C")) { e.preventDefault(); copySelected(); return; }
-      if (mod && (e.key === "v" || e.key === "V")) { e.preventDefault(); pasteClipboard(); return; }
+      if (mod && (e.key === "v" || e.key === "V")) {
+        // Yield to the Import Image modal's own paste listener while it's
+        // open — critically, skip preventDefault too, or the browser's
+        // native paste event (which that listener depends on) never fires.
+        if (importOpenRef.current) return;
+        e.preventDefault(); pasteClipboard(); return;
+      }
       if (mod && (e.key === "d" || e.key === "D")) { e.preventDefault(); duplicateSelected(); return; }
 
       // Pen tool: while a path is being built, these keys own the path
@@ -755,6 +765,16 @@ export function DotArtTool() {
         if (e.key === "Enter") { e.preventDefault(); finishPenPathRef.current(penAnchorsRef.current); return; }
         if (e.key === "Escape") { e.preventDefault(); cancelPenPathRef.current(); return; }
         if (e.key === "Delete" || e.key === "Backspace") { e.preventDefault(); popPenAnchor(); return; }
+      }
+
+      // Array tool, Curve mode: while a path is being drawn, these keys own
+      // it. Enter is a convenience alias for Apply (there's no separate
+      // "finish path, then apply" step — sliders can be tuned regardless of
+      // anchor count, Apply is the only commit action).
+      if (toolRef.current === "array" && arrayCurveAnchorsRef.current.length > 0) {
+        if (e.key === "Enter") { e.preventDefault(); applyArrayRef.current(); return; }
+        if (e.key === "Escape") { e.preventDefault(); cancelArrayCurveRef.current(); return; }
+        if (e.key === "Delete" || e.key === "Backspace") { e.preventDefault(); popArrayCurveAnchor(); return; }
       }
 
       if (e.key === "Delete" || e.key === "Backspace") {
@@ -779,6 +799,7 @@ export function DotArtTool() {
       if (e.key === "l" || e.key === "L") { setTool("line"); sfx.toolDraw(); }
       if (e.key === "p" || e.key === "P") { setTool("pen"); sfx.toolDraw(); }
       if (!mod && (e.key === "s" || e.key === "S")) { setTool("shape"); sfx.toolDraw(); }
+      if (!mod && (e.key === "a" || e.key === "A")) { setTool("array"); sfx.toolDraw(); }
     };
     // Capture phase so our shortcuts run before any host/bubble handler that
     // might swallow Ctrl+Z (e.g. an embedding preview's own undo).
@@ -877,11 +898,16 @@ export function DotArtTool() {
       const next = new Map(prev);
       if (toolRef.current === "erase") next.delete(key);
       else {
+        const minDist = minSpacingRef.current * FINE_CELL;
+        // Same-key overwrites (recoloring/redrawing an already-placed dot)
+        // always go through — the gate only blocks placing a genuinely new
+        // dot too close to a different one.
+        if (!next.has(key) && !farEnough(x, y, next, minDist)) return next;
         next.set(key, { key, x, y, color: colorRef.current, radius: radiusRef.current });
         if (mirrorXRef.current || mirrorYRef.current) {
           const { w, h } = canvasBoundsRef.current;
           for (const m of mirrorSnaps(x, y, w, h, snapModeRef.current, mirrorXRef.current, mirrorYRef.current)) {
-            if (m.key !== key) next.set(m.key, { key: m.key, x: m.x, y: m.y, color: colorRef.current, radius: radiusRef.current });
+            if (m.key !== key && (next.has(m.key) || farEnough(m.x, m.y, next, minDist))) next.set(m.key, { key: m.key, x: m.x, y: m.y, color: colorRef.current, radius: radiusRef.current });
           }
         }
       }
@@ -1049,11 +1075,15 @@ export function DotArtTool() {
     setDots((prev) => {
       const next = new Map(prev);
       const { w, h } = canvasBoundsRef.current;
+      const minDist = minSpacingRef.current * FINE_CELL;
       for (const p of pts) {
+        // Applies on top of whatever the Spacing model already produced —
+        // an absolute floor, even over a deliberately tight Pulse cluster.
+        if (!next.has(p.key) && !farEnough(p.x, p.y, next, minDist)) continue;
         next.set(p.key, { key: p.key, x: p.x, y: p.y, color: colorRef.current, radius: radiusRef.current });
         if (mirrorXRef.current || mirrorYRef.current) {
           for (const m of mirrorSnaps(p.x, p.y, w, h, snapModeRef.current, mirrorXRef.current, mirrorYRef.current)) {
-            if (m.key !== p.key) next.set(m.key, { key: m.key, x: m.x, y: m.y, color: colorRef.current, radius: radiusRef.current });
+            if (m.key !== p.key && (next.has(m.key) || farEnough(m.x, m.y, next, minDist))) next.set(m.key, { key: m.key, x: m.x, y: m.y, color: colorRef.current, radius: radiusRef.current });
           }
         }
       }
@@ -1199,6 +1229,150 @@ export function DotArtTool() {
   useEffect(() => { finishPenPathRef.current = finishPenPath; }, [finishPenPath]);
   useEffect(() => { cancelPenPathRef.current = cancelPenPath; }, [cancelPenPath]);
 
+  // ── Array tool (motif repetition: linear/grid/curve) ─────────────────────
+  // Repeats the current selection ("the motif") into new dots via
+  // src/lib/array.ts's pure transform math. Destructive/commit-based: sliders
+  // drive a live ghost preview (see arrayPreview below, near the other
+  // render-time derivations), nothing writes to `dots` until Apply.
+  const [arrayMode, setArrayMode] = useState<ArrayMode>(() => {
+    try { const m = localStorage.getItem("tangaliya-array-mode"); return (m === "grid" || m === "curve") ? m : "linear"; } catch { return "linear"; }
+  });
+  const arrayModeRef = useRef(arrayMode);
+  useEffect(() => {
+    arrayModeRef.current = arrayMode;
+    try { localStorage.setItem("tangaliya-array-mode", arrayMode); } catch { /* ignore */ }
+  }, [arrayMode]);
+
+  const [arrayLinearAngle, setArrayLinearAngle] = useState<number>(() => {
+    try { return Number(localStorage.getItem("tangaliya-array-linear-angle")) || 0; } catch { return 0; }
+  });
+  const arrayLinearAngleRef = useRef(arrayLinearAngle);
+  useEffect(() => { arrayLinearAngleRef.current = arrayLinearAngle; try { localStorage.setItem("tangaliya-array-linear-angle", String(arrayLinearAngle)); } catch { /* ignore */ } }, [arrayLinearAngle]);
+
+  const [arrayLinearCount, setArrayLinearCount] = useState<number>(() => {
+    try { return Number(localStorage.getItem("tangaliya-array-linear-count")) || 4; } catch { return 4; }
+  });
+  const arrayLinearCountRef = useRef(arrayLinearCount);
+  useEffect(() => { arrayLinearCountRef.current = arrayLinearCount; try { localStorage.setItem("tangaliya-array-linear-count", String(arrayLinearCount)); } catch { /* ignore */ } }, [arrayLinearCount]);
+
+  const [arrayLinearSpacing, setArrayLinearSpacing] = useState<number>(() => {
+    try { return Number(localStorage.getItem("tangaliya-array-linear-spacing")) || 60; } catch { return 60; }
+  });
+  const arrayLinearSpacingRef = useRef(arrayLinearSpacing);
+  useEffect(() => { arrayLinearSpacingRef.current = arrayLinearSpacing; try { localStorage.setItem("tangaliya-array-linear-spacing", String(arrayLinearSpacing)); } catch { /* ignore */ } }, [arrayLinearSpacing]);
+
+  // Corner (default, false) = the motif is one end of the ray, array only
+  // grows "forward" along angleDeg. Center (true) = the motif is the
+  // midpoint, array spreads both ways along the ray.
+  const [arrayLinearCentered, setArrayLinearCentered] = useState<boolean>(() => {
+    try { return localStorage.getItem("tangaliya-array-linear-centered") === "1"; } catch { return false; }
+  });
+  const arrayLinearCenteredRef = useRef(arrayLinearCentered);
+  useEffect(() => { arrayLinearCenteredRef.current = arrayLinearCentered; try { localStorage.setItem("tangaliya-array-linear-centered", arrayLinearCentered ? "1" : "0"); } catch { /* ignore */ } }, [arrayLinearCentered]);
+
+  const [arrayGridRows, setArrayGridRows] = useState<number>(() => {
+    try { return Number(localStorage.getItem("tangaliya-array-grid-rows")) || 3; } catch { return 3; }
+  });
+  const arrayGridRowsRef = useRef(arrayGridRows);
+  useEffect(() => { arrayGridRowsRef.current = arrayGridRows; try { localStorage.setItem("tangaliya-array-grid-rows", String(arrayGridRows)); } catch { /* ignore */ } }, [arrayGridRows]);
+
+  const [arrayGridCols, setArrayGridCols] = useState<number>(() => {
+    try { return Number(localStorage.getItem("tangaliya-array-grid-cols")) || 3; } catch { return 3; }
+  });
+  const arrayGridColsRef = useRef(arrayGridCols);
+  useEffect(() => { arrayGridColsRef.current = arrayGridCols; try { localStorage.setItem("tangaliya-array-grid-cols", String(arrayGridCols)); } catch { /* ignore */ } }, [arrayGridCols]);
+
+  const [arrayGridSpacingX, setArrayGridSpacingX] = useState<number>(() => {
+    try { return Number(localStorage.getItem("tangaliya-array-grid-spacing-x")) || 60; } catch { return 60; }
+  });
+  const arrayGridSpacingXRef = useRef(arrayGridSpacingX);
+  useEffect(() => { arrayGridSpacingXRef.current = arrayGridSpacingX; try { localStorage.setItem("tangaliya-array-grid-spacing-x", String(arrayGridSpacingX)); } catch { /* ignore */ } }, [arrayGridSpacingX]);
+
+  const [arrayGridSpacingY, setArrayGridSpacingY] = useState<number>(() => {
+    try { return Number(localStorage.getItem("tangaliya-array-grid-spacing-y")) || 60; } catch { return 60; }
+  });
+  const arrayGridSpacingYRef = useRef(arrayGridSpacingY);
+  useEffect(() => { arrayGridSpacingYRef.current = arrayGridSpacingY; try { localStorage.setItem("tangaliya-array-grid-spacing-y", String(arrayGridSpacingY)); } catch { /* ignore */ } }, [arrayGridSpacingY]);
+
+  // 0% = plain grid, 50% = classic brick coursing — one slider covers both.
+  const [arrayGridRowOffsetPct, setArrayGridRowOffsetPct] = useState<number>(() => {
+    try { return Number(localStorage.getItem("tangaliya-array-grid-row-offset")) || 0; } catch { return 0; }
+  });
+  const arrayGridRowOffsetPctRef = useRef(arrayGridRowOffsetPct);
+  useEffect(() => { arrayGridRowOffsetPctRef.current = arrayGridRowOffsetPct; try { localStorage.setItem("tangaliya-array-grid-row-offset", String(arrayGridRowOffsetPct)); } catch { /* ignore */ } }, [arrayGridRowOffsetPct]);
+
+  // Corner (default, false) = motif is cell (row0,col0), grid only grows
+  // right+down. Center (true) = motif's cell is the grid's middle, so it
+  // spreads on all 4 sides — this is the fix for "array only goes right/down".
+  const [arrayGridCentered, setArrayGridCentered] = useState<boolean>(() => {
+    try { return localStorage.getItem("tangaliya-array-grid-centered") === "1"; } catch { return false; }
+  });
+  const arrayGridCenteredRef = useRef(arrayGridCentered);
+  useEffect(() => { arrayGridCenteredRef.current = arrayGridCentered; try { localStorage.setItem("tangaliya-array-grid-centered", arrayGridCentered ? "1" : "0"); } catch { /* ignore */ } }, [arrayGridCentered]);
+
+  const [arrayCurveCount, setArrayCurveCount] = useState<number>(() => {
+    try { return Number(localStorage.getItem("tangaliya-array-curve-count")) || 8; } catch { return 8; }
+  });
+  const arrayCurveCountRef = useRef(arrayCurveCount);
+  useEffect(() => { arrayCurveCountRef.current = arrayCurveCount; try { localStorage.setItem("tangaliya-array-curve-count", String(arrayCurveCount)); } catch { /* ignore */ } }, [arrayCurveCount]);
+
+  const [arrayCurveSpacing, setArrayCurveSpacing] = useState<number>(() => {
+    try { return Number(localStorage.getItem("tangaliya-array-curve-spacing")) || 40; } catch { return 40; }
+  });
+  const arrayCurveSpacingRef = useRef(arrayCurveSpacing);
+  useEffect(() => { arrayCurveSpacingRef.current = arrayCurveSpacing; try { localStorage.setItem("tangaliya-array-curve-spacing", String(arrayCurveSpacing)); } catch { /* ignore */ } }, [arrayCurveSpacing]);
+
+  const [arrayCurveAlign, setArrayCurveAlign] = useState<boolean>(() => {
+    try { return localStorage.getItem("tangaliya-array-curve-align") !== "0"; } catch { return true; }
+  });
+  const arrayCurveAlignRef = useRef(arrayCurveAlign);
+  useEffect(() => { arrayCurveAlignRef.current = arrayCurveAlign; try { localStorage.setItem("tangaliya-array-curve-align", arrayCurveAlign ? "1" : "0"); } catch { /* ignore */ } }, [arrayCurveAlign]);
+
+  const [arrayPathCurved, setArrayPathCurved] = useState<boolean>(() => {
+    try { return localStorage.getItem("tangaliya-array-path-curved") === "1"; } catch { return false; }
+  });
+  const arrayPathCurvedRef = useRef(arrayPathCurved);
+  useEffect(() => { arrayPathCurvedRef.current = arrayPathCurved; try { localStorage.setItem("tangaliya-array-path-curved", arrayPathCurved ? "1" : "0"); } catch { /* ignore */ } }, [arrayPathCurved]);
+
+  // Curve-mode anchor drawing — ephemeral, not persisted (a mid-draw curve
+  // shouldn't survive a reload, same as the Pen tool's anchors don't).
+  const [arrayCurveAnchors, setArrayCurveAnchors] = useState<{ x: number; y: number }[]>([]);
+  const arrayCurveAnchorsRef = useRef<{ x: number; y: number }[]>([]);
+  const [arrayCurveCursor, setArrayCurveCursor] = useState<{ x: number; y: number } | null>(null);
+  const arrayCurveCursorRef = useRef<{ x: number; y: number } | null>(null);
+
+  const cancelArrayCurve = useCallback(() => {
+    arrayCurveAnchorsRef.current = []; setArrayCurveAnchors([]);
+    arrayCurveCursorRef.current = null; setArrayCurveCursor(null);
+  }, []);
+  const popArrayCurveAnchor = useCallback(() => {
+    const next = arrayCurveAnchorsRef.current.slice(0, -1);
+    arrayCurveAnchorsRef.current = next; setArrayCurveAnchors(next);
+  }, []);
+
+  // Gathers the motif from the current selection, computes this mode's
+  // transform list, and commits. Curve mode clears its drawn anchors after a
+  // successful apply (matches Pen: a committed path doesn't linger).
+  const applyArray = useCallback(() => {
+    const motif = Array.from(selectedKeysRef.current)
+      .map((k) => dotsRef.current.get(k))
+      .filter((d): d is Dot => !!d);
+    if (motif.length === 0) return;
+    const mode = arrayModeRef.current;
+    const transforms =
+      mode === "linear" ? computeLinearInstances({ angleDeg: arrayLinearAngleRef.current, count: arrayLinearCountRef.current, spacing: arrayLinearSpacingRef.current, centered: arrayLinearCenteredRef.current }) :
+      mode === "grid" ? computeGridInstances({ rows: arrayGridRowsRef.current, cols: arrayGridColsRef.current, spacingX: arrayGridSpacingXRef.current, spacingY: arrayGridSpacingYRef.current, rowOffsetPct: arrayGridRowOffsetPctRef.current, centered: arrayGridCenteredRef.current }) :
+      computeCurveInstances(motifPivot(motif), { anchors: arrayCurveAnchorsRef.current, curved: arrayPathCurvedRef.current, count: arrayCurveCountRef.current, spacing: arrayCurveSpacingRef.current, alignToCurve: arrayCurveAlignRef.current });
+    commitArrayDots(motif, transforms);
+    if (mode === "curve") cancelArrayCurve();
+  }, [commitArrayDots, cancelArrayCurve]);
+  // Same TDZ-avoidance idiom as finishPenPathRef — the keydown effect sits
+  // above this callback in source order.
+  const applyArrayRef = useRef(applyArray);
+  const cancelArrayCurveRef = useRef(cancelArrayCurve);
+  useEffect(() => { applyArrayRef.current = applyArray; }, [applyArray]);
+  useEffect(() => { cancelArrayCurveRef.current = cancelArrayCurve; }, [cancelArrayCurve]);
+
   const paintStrokeTo = useCallback((wx: number, wy: number) => {
     const spacing = snapSpacing(snapModeRef.current);
     const { w, h } = canvasBoundsRef.current;
@@ -1257,13 +1431,15 @@ export function DotArtTool() {
       const next = new Map(prev);
       const { w: cw, h: ch } = canvasBoundsRef.current;
       const mx = mirrorXRef.current, my = mirrorYRef.current;
+      const minDist = minSpacingRef.current * FINE_CELL;
       for (const s of steps) {
         if (toolRef.current === "erase") next.delete(s.key);
         else {
+          if (!next.has(s.key) && !farEnough(s.x, s.y, next, minDist)) continue; // too close to an already-placed bead — skip, walk continues
           next.set(s.key, { key: s.key, x: s.x, y: s.y, color: colorRef.current, radius: radiusRef.current });
           if (mx || my) {
             for (const m of mirrorSnaps(s.x, s.y, cw, ch, snapModeRef.current, mx, my)) {
-              if (m.key !== s.key) next.set(m.key, { key: m.key, x: m.x, y: m.y, color: colorRef.current, radius: radiusRef.current });
+              if (m.key !== s.key && (next.has(m.key) || farEnough(m.x, m.y, next, minDist))) next.set(m.key, { key: m.key, x: m.x, y: m.y, color: colorRef.current, radius: radiusRef.current });
             }
           }
         }
@@ -1380,6 +1556,17 @@ export function DotArtTool() {
     // Only strokes that start on the canvas SVG count — the container div
     // also holds zoom buttons, panel FABs, and the webcam overlay.
     if (!svgRef.current || !svgRef.current.contains(e.target as Node)) return;
+
+    // Reclaim keyboard shortcuts from a lingering focused text field. The
+    // e.preventDefault() below (needed to stop native touch-scroll/text
+    // selection on the canvas) also suppresses the browser's implicit
+    // focus-shift-on-click — so without this, typing into any field (cell
+    // size, canvas W/H, a hex color, a layer name...) and then clicking the
+    // canvas to marquee-select leaves that field focused. The global keydown
+    // handler's `typing` guard then silently swallows Delete/Backspace/Arrow
+    // shortcuts — the "select-all-then-delete does nothing" bug.
+    const active = document.activeElement as HTMLElement | null;
+    if (active && (active.tagName === "INPUT" || active.tagName === "TEXTAREA" || active.isContentEditable)) active.blur();
     if (e.pointerType === "touch") {
       if (penActiveRef.current) return; // palm rejection while a pen is drawing
       e.preventDefault();
@@ -1464,6 +1651,7 @@ export function DotArtTool() {
         isDraggingDotsRef.current = true;
         dragStartWorldRef.current = { x: world.x, y: world.y };
         preDragDotsRef.current = new Map(dotsRef.current);
+        dragBBoxRef.current = selectionBBox(dotsRef.current, selectedKeysRef.current);
         snappedOffsetRef.current = { dx: 0, dy: 0 };
       } else {
         setSelectedKeys(new Set());
@@ -1532,6 +1720,35 @@ export function DotArtTool() {
       return;
     }
 
+    if (toolRef.current === "array" && arrayModeRef.current === "curve") {
+      // Same click-to-anchor state machine as Pen, but nothing is computed or
+      // committed here — this only accumulates path anchors. The live
+      // preview (render-time) and Apply both read arrayCurveAnchorsRef
+      // directly whenever they need it.
+      const anchors = arrayCurveAnchorsRef.current;
+      const last = anchors[anchors.length - 1];
+      const target = (e.shiftKey && last) ? constrainAngle15(last.x, last.y, world.x, world.y) : world;
+      const snap = getNearestSnap(target.x, target.y, CELL_SIZE, snapModeRef.current, canvasBoundsRef.current.w, canvasBoundsRef.current.h);
+      if (!snap) return;
+
+      // Closing the loop near the first anchor is free (same reach test as
+      // Pen) — lets a curve array wrap into a closed ring of motifs.
+      if (anchors.length >= 2) {
+        const first = anchors[0];
+        const closeReach = snapSpacing(snapModeRef.current) * 0.75;
+        if (Math.hypot(snap.x - first.x, snap.y - first.y) <= closeReach) {
+          const closed = [...anchors, { x: first.x, y: first.y }];
+          arrayCurveAnchorsRef.current = closed; setArrayCurveAnchors(closed);
+          return;
+        }
+      }
+
+      const nextAnchors = [...anchors, { x: snap.x, y: snap.y }];
+      arrayCurveAnchorsRef.current = nextAnchors; setArrayCurveAnchors(nextAnchors);
+      arrayCurveCursorRef.current = { x: snap.x, y: snap.y }; setArrayCurveCursor({ x: snap.x, y: snap.y });
+      return;
+    }
+
     pushUndo();
     isPaintingRef.current = true;
 
@@ -1593,8 +1810,10 @@ export function DotArtTool() {
         const rawDx = world.x - dragStartWorldRef.current.x;
         const rawDy = world.y - dragStartWorldRef.current.y;
         const dragSpacing = snapSpacing(snapModeRef.current);
-        const snappedDx = Math.round(rawDx / dragSpacing) * dragSpacing;
-        const snappedDy = Math.round(rawDy / dragSpacing) * dragSpacing;
+        let snappedDx = Math.round(rawDx / dragSpacing) * dragSpacing;
+        let snappedDy = Math.round(rawDy / dragSpacing) * dragSpacing;
+        const bb = dragBBoxRef.current;
+        if (bb) ({ dx: snappedDx, dy: snappedDy } = clampOffsetToCanvas(snappedDx, snappedDy, bb, canvasBoundsRef.current.w, canvasBoundsRef.current.h, dragSpacing));
         snappedOffsetRef.current = { dx: snappedDx, dy: snappedDy };
         setDragOffset({ dx: snappedDx, dy: snappedDy });
       } else if (isMarqueeingRef.current && marqueeStartRef.current) {
@@ -1667,6 +1886,15 @@ export function DotArtTool() {
         penCursorRef.current = cursor;
         setPenCursor(cursor);
         setPenPreview(penDots([...penAnchorsRef.current, cursor]));
+      }
+      return;
+    }
+
+    if (toolRef.current === "array" && arrayModeRef.current === "curve") {
+      if (arrayCurveAnchorsRef.current.length > 0) {
+        const snap = getNearestSnap(world.x, world.y, CELL_SIZE, snapModeRef.current, canvasBoundsRef.current.w, canvasBoundsRef.current.h);
+        const cursor = snap ? { x: snap.x, y: snap.y } : world;
+        arrayCurveCursorRef.current = cursor; setArrayCurveCursor(cursor);
       }
       return;
     }
@@ -1784,6 +2012,9 @@ export function DotArtTool() {
     // Pen: a click's release commits nothing — the path stays open, waiting
     // for the next anchor (or Enter / close-click / Escape / Backspace).
     if (toolRef.current === "pen") return;
+    // Array/Curve: same — clicks fully resolve on pointer-down, nothing to
+    // do on release. Linear/Grid have no drag at all, so they never reach here.
+    if (toolRef.current === "array") return;
 
     isPaintingRef.current = false;
     // Remember where this draw ended so the next placement can be measured
@@ -1948,11 +2179,14 @@ export function DotArtTool() {
               lastHandKeyRef.current = snap.key;
               setDots((prev) => {
                 const next = new Map(prev);
-                next.set(snap.key, { key: snap.key, x: snap.x, y: snap.y, color: colorRef.current, radius: radiusRef.current });
-                if (mirrorXRef.current || mirrorYRef.current) {
-                  const { w, h } = canvasBoundsRef.current;
-                  for (const m of mirrorSnaps(snap.x, snap.y, w, h, snapModeRef.current, mirrorXRef.current, mirrorYRef.current)) {
-                    if (m.key !== snap.key) next.set(m.key, { key: m.key, x: m.x, y: m.y, color: colorRef.current, radius: radiusRef.current });
+                const minDist = minSpacingRef.current * FINE_CELL;
+                if (next.has(snap.key) || farEnough(snap.x, snap.y, next, minDist)) {
+                  next.set(snap.key, { key: snap.key, x: snap.x, y: snap.y, color: colorRef.current, radius: radiusRef.current });
+                  if (mirrorXRef.current || mirrorYRef.current) {
+                    const { w, h } = canvasBoundsRef.current;
+                    for (const m of mirrorSnaps(snap.x, snap.y, w, h, snapModeRef.current, mirrorXRef.current, mirrorYRef.current)) {
+                      if (m.key !== snap.key && (next.has(m.key) || farEnough(m.x, m.y, next, minDist))) next.set(m.key, { key: m.key, x: m.x, y: m.y, color: colorRef.current, radius: radiusRef.current });
+                    }
                   }
                 }
                 return next;
@@ -2076,9 +2310,7 @@ export function DotArtTool() {
     const allDots = flattenLayers(layers);
     const content = buildSVGString(allDots, canvasPxW, canvasPxH, pxPerUnit, unit, canvasBg, gridColor, gridOpacity, gridThickness, CELL_SIZE, dotShape);
     const blob = new Blob([content], { type: "image/svg+xml" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a"); a.href = url; a.download = "dot-art.svg"; a.click();
-    URL.revokeObjectURL(url);
+    downloadBlob(blob, "dot-art.svg");
   }, [layers, canvasPxW, canvasPxH, pxPerUnit, unit, canvasBg, gridColor, gridOpacity, gridThickness, dotShape]);
 
   const exportPNG = useCallback(() => {
@@ -2110,10 +2342,7 @@ export function DotArtTool() {
       ctx.fillText(`${allDots.length} dots`, Math.round(8 * scale), outH + captionH / 2);
       canvas.toBlob((blob) => {
         if (!blob) return;
-        const dlUrl = URL.createObjectURL(blob);
-        const a = document.createElement("a");
-        a.href = dlUrl; a.download = "dot-art.png"; a.click();
-        URL.revokeObjectURL(dlUrl);
+        downloadBlob(blob, "dot-art.png");
       }, "image/png");
     };
     img.onerror = () => URL.revokeObjectURL(url);
@@ -2125,12 +2354,11 @@ export function DotArtTool() {
     const allDots = flattenLayers(layers);
     const svgContent = buildSVGString(allDots, canvasPxW, canvasPxH, pxPerUnit, unit, canvasBg, gridColor, gridOpacity, gridThickness, CELL_SIZE, dotShape);
 
-    // Physical dimensions in mm for PDF
     const widthMm = unit === "mm" ? canvasPhysW : convertUnit(canvasPhysW, unit, "mm");
     const heightMm = unit === "mm" ? canvasPhysH : convertUnit(canvasPhysH, unit, "mm");
 
-    // Render at 300 DPI for print quality
-    const dpi = 300;
+    const dpi = 300; // print quality
+
     const renderW = Math.round(widthMm / 25.4 * dpi);
     const renderH = Math.round(heightMm / 25.4 * dpi);
 
@@ -2160,7 +2388,7 @@ export function DotArtTool() {
       pdf.setFontSize(9);
       pdf.setTextColor(120);
       pdf.text(`${allDots.length} dots`, 3, heightMm + captionMm - 2);
-      pdf.save("dot-art.pdf");
+      downloadBlob(pdf.output("blob"), "dot-art.pdf");
     };
     img.onerror = () => URL.revokeObjectURL(url);
     img.src = url;
@@ -2170,6 +2398,7 @@ export function DotArtTool() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const imageInputRef = useRef<HTMLInputElement>(null);
   const importPreviewRef = useRef<HTMLCanvasElement>(null); // the modal's preview canvas
+  const importPreviewBoxRef = useRef<HTMLDivElement>(null);  // its container — measured for resize-fit
   const fontInputRef = useRef<HTMLInputElement>(null);
   const textPreviewRef = useRef<HTMLCanvasElement>(null);
 
@@ -2180,9 +2409,9 @@ export function DotArtTool() {
     layers: layers.map((l) => ({ id: l.id, name: l.name, visible: l.visible, dots: Array.from(l.dots.values()) })),
     unit, cellPhysical, canvasPhysW, canvasPhysH,
     canvasBg, gridColor, gridOpacity, gridThickness,
-    snapMode, color, radius, snapReach, eraseRadius, recentColors,
+    snapMode, color, radius, snapReach, eraseRadius, recentColors, minSpacing,
   }), [layers, unit, cellPhysical, canvasPhysW, canvasPhysH, canvasBg, gridColor,
-    gridOpacity, gridThickness, snapMode, color, radius, snapReach, eraseRadius, recentColors]);
+    gridOpacity, gridThickness, snapMode, color, radius, snapReach, eraseRadius, recentColors, minSpacing]);
 
   // Replace the entire document with a loaded scene (undoable, re-fits the view).
   const applyScene = useCallback((scene: SceneFile) => {
@@ -2208,6 +2437,8 @@ export function DotArtTool() {
     setSnapReach(scene.snapReach); snapReachRef.current = scene.snapReach;
     setEraseRadius(scene.eraseRadius); eraseRadiusRef.current = scene.eraseRadius;
     if (Array.isArray(scene.recentColors)) setRecentColors(scene.recentColors);
+    const nextMinSpacing = scene.minSpacing ?? 1; // optional field, back-compat with older files
+    setMinSpacing(nextMinSpacing); minSpacingRef.current = nextMinSpacing;
 
     // Fit the loaded canvas to the viewport. Computed from the scene's own
     // dimensions (pure numbers via viewportRef) so it's correct immediately,
@@ -2223,69 +2454,6 @@ export function DotArtTool() {
     }
   }, [pushUndo, applyViewport]);
 
-  // ── Layer operations ──
-  // Structure edits (add/delete/reorder/rename/visibility/activate) are NOT on
-  // the undo stack in v1 — only dot edits within a layer are. They read the
-  // live stack via `layersRef` and write `setLayers` + keep the ref in sync.
-  const selectLayer = useCallback((id: string) => {
-    setActiveLayerId(id); activeLayerIdRef.current = id;
-    setSelectedKeys(new Set()); selectedKeysRef.current = new Set();
-    sfx.toggle();
-  }, []);
-  const addLayer = useCallback(() => {
-    const ls = layersRef.current;
-    const idx = ls.findIndex((l) => l.id === activeLayerIdRef.current);
-    const at = idx < 0 ? ls.length : idx + 1; // above the active layer
-    const nl: Layer = { id: genLayerId(), name: `Layer ${ls.length + 1}`, visible: true, dots: new Map() };
-    const next = [...ls.slice(0, at), nl, ...ls.slice(at)];
-    setLayers(next); layersRef.current = next;
-    setActiveLayerId(nl.id); activeLayerIdRef.current = nl.id;
-    setSelectedKeys(new Set()); selectedKeysRef.current = new Set();
-    sfx.toggle();
-  }, []);
-  const duplicateLayer = useCallback((id: string) => {
-    const ls = layersRef.current;
-    const idx = ls.findIndex((l) => l.id === id);
-    if (idx < 0) return;
-    const src = ls[idx];
-    const nl: Layer = { id: genLayerId(), name: `${src.name} copy`, visible: src.visible, dots: new Map(src.dots) };
-    const next = [...ls.slice(0, idx + 1), nl, ...ls.slice(idx + 1)];
-    setLayers(next); layersRef.current = next;
-    setActiveLayerId(nl.id); activeLayerIdRef.current = nl.id;
-    sfx.toggle();
-  }, []);
-  const deleteLayer = useCallback((id: string) => {
-    const ls = layersRef.current;
-    if (ls.length <= 1) return; // always keep one layer
-    const idx = ls.findIndex((l) => l.id === id);
-    const next = ls.filter((l) => l.id !== id);
-    setLayers(next); layersRef.current = next;
-    if (activeLayerIdRef.current === id) {
-      const na = next[Math.max(0, idx - 1)] ?? next[0];
-      setActiveLayerId(na.id); activeLayerIdRef.current = na.id;
-      setSelectedKeys(new Set()); selectedKeysRef.current = new Set();
-    }
-    sfx.toggle();
-  }, []);
-  const moveLayer = useCallback((id: string, dir: 1 | -1) => {
-    const ls = layersRef.current;
-    const idx = ls.findIndex((l) => l.id === id);
-    const j = idx + dir;
-    if (idx < 0 || j < 0 || j >= ls.length) return;
-    const next = [...ls];
-    [next[idx], next[j]] = [next[j], next[idx]];
-    setLayers(next); layersRef.current = next;
-    sfx.toggle();
-  }, []);
-  const toggleLayerVisible = useCallback((id: string) => {
-    const next = layersRef.current.map((l) => (l.id === id ? { ...l, visible: !l.visible } : l));
-    setLayers(next); layersRef.current = next;
-    sfx.toggle();
-  }, []);
-  const renameLayer = useCallback((id: string, name: string) => {
-    const next = layersRef.current.map((l) => (l.id === id ? { ...l, name } : l));
-    setLayers(next); layersRef.current = next;
-  }, []);
   // Canvas nav arrows: dir=1 = layer above (next index up — index 0 is the
   // bottom of the stack, same convention as moveLayer's "Move up"), dir=-1 =
   // layer below. Reuses selectLayer (clears selection, syncs refs, plays its
@@ -2307,9 +2475,7 @@ export function DotArtTool() {
   const saveProject = useCallback(() => {
     sfx.export();
     const blob = new Blob([JSON.stringify(buildScene(), null, 2)], { type: "application/json" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a"); a.href = url; a.download = "tangaliya-project.json"; a.click();
-    URL.revokeObjectURL(url);
+    downloadBlob(blob, "tangaliya-project.json");
   }, [buildScene]);
 
   const openProjectFile = useCallback((file: File) => {
@@ -2327,30 +2493,111 @@ export function DotArtTool() {
   // The "Import Image" modal tunes a conversion against a loaded image and shows
   // a live preview; "Add to canvas" commits the dots to the real editor.
 
-  // Target canvas dims matching the loaded image's aspect ratio (keeps the cell
-  // size and the current long-edge cell count). Drives both preview and commit.
-  const importDims = useMemo(() => {
-    if (!importImg) return null;
-    const longPhys = Math.max(canvasPhysW, canvasPhysH) || 1;
-    return computeImportDims(importImg.width, importImg.height, longPhys, importCell);
-  }, [importImg, canvasPhysW, canvasPhysH, importCell]);
+  // Open the modal, seeding its local canvas-size override from the live
+  // canvas (and cell size from the live cell) so it starts matching today's
+  // document — editing it here never touches the real canvas until commit.
+  const openImportModal = useCallback(() => {
+    setImportCell(cellPhysical);
+    setImportW(canvasPhysW); setImportWInput(String(canvasPhysW));
+    setImportH(canvasPhysH); setImportHInput(String(canvasPhysH));
+    setPaletteEdits({});
+    setImportOpen(true);
+  }, [cellPhysical, canvasPhysW, canvasPhysH]);
+
+  const commitImportW = () => {
+    const parsed = parseFloat(importWInput);
+    if (!isNaN(parsed) && parsed > 0) {
+      const v = roundForUnit(parsed, unit);
+      setImportW(v); setImportWInput(String(v));
+    } else setImportWInput(String(importW));
+  };
+  const commitImportH = () => {
+    const parsed = parseFloat(importHInput);
+    if (!isNaN(parsed) && parsed > 0) {
+      const v = roundForUnit(parsed, unit);
+      setImportH(v); setImportHInput(String(v));
+    } else setImportHInput(String(importH));
+  };
+  // Escape hatch back to today's default (canvas size derived from the loaded
+  // image's own aspect ratio), since auto-aspect no longer happens on load.
+  const matchImageRatio = () => {
+    if (!importImg) return;
+    const v = roundForUnit((importW * importImg.height) / importImg.width, unit);
+    setImportH(v); setImportHInput(String(v));
+  };
+
+  // Target canvas dims from the modal-local W×H override + cell size — a
+  // direct grid computation, independent of any loaded image (so the modal
+  // has a size before an image is even chosen).
+  const importDims = useMemo(() => computeCanvasDims(importW, importH, importCell), [importW, importH, importCell]);
+
+  // Quantized palette + palette-colored dots — only computed for the "palette"
+  // style (Light & Shadow keeps continuous image RGB, no quantization).
+  const basePalette = useMemo(() => {
+    if (!importImg || imgStyle !== "palette") return null;
+    return buildPaletteDots(importImg, importDims.pxW, importDims.pxH,
+      { colorCount: traceColorCount, threshold: traceThreshold, dotRadius: traceDotSize, snapMode: traceDetail });
+  }, [importImg, importDims, imgStyle, traceColorCount, traceThreshold, traceDotSize, traceDetail]);
+
+  // Palette with manual swatch edits applied — a pure lookup, never re-quantizes.
+  const effectivePalette = useMemo(() =>
+    basePalette ? basePalette.palette.map((c) => paletteEdits[c] ?? c) : null,
+  [basePalette, paletteEdits]);
 
   // Live preview dots — recomputed whenever the image or any control changes.
+  // The final Min. Spacing pass reuses the same app-wide floor as every other
+  // placement path (draw, brush, line/pen/shape, array, hand-draw).
   const previewDots = useMemo(() => {
-    if (!importImg || !importDims) return null;
-    return buildDotsFromImage(importImg, importDims.pxW, importDims.pxH, {
-      style: traceStyle, threshold: traceThreshold, dotRadius: traceDotSize, snapMode: traceDetail, monoColor: color, tonalColor: traceTonalColor,
-    });
-  }, [importImg, importDims, traceStyle, traceThreshold, traceDotSize, traceDetail, color, traceTonalColor]);
+    if (!importImg) return null;
+    const minDist = minSpacing * FINE_CELL;
+    if (imgStyle === "tonal") {
+      const raw = buildDotsFromImage(importImg, importDims.pxW, importDims.pxH, {
+        style: "tonal", threshold: traceThreshold, dotRadius: traceDotSize, snapMode: traceDetail, monoColor: "#000000", tonalColor: traceTonalColor,
+      });
+      return filterMinSpacing(raw, minDist);
+    }
+    if (!basePalette) return null;
+    if (!effectivePalette) return filterMinSpacing(basePalette.dots, minDist);
+    // Recolor: reuse each Dot object unchanged unless its slot's color was
+    // edited, so an untouched palette produces byte-identical Dot references.
+    const out = new Map<string, Dot>();
+    for (const [key, dot] of basePalette.dots) {
+      const slot = basePalette.index.get(key);
+      const nextColor = slot != null ? effectivePalette[slot] : dot.color;
+      out.set(key, nextColor === dot.color ? dot : { ...dot, color: nextColor });
+    }
+    return filterMinSpacing(out, minDist);
+  }, [importImg, importDims, imgStyle, traceThreshold, traceDotSize, traceDetail, traceTonalColor, basePalette, effectivePalette, minSpacing]);
 
   const openImportFile = useCallback(async (file: File) => {
     try {
       const bitmap = await createImageBitmap(file);
       setImportImg(bitmap);
+      setPaletteEdits({}); // a new/different image starts with a clean palette
     } catch {
       alert("Couldn't read that image.");
     }
   }, []);
+
+  // Paste an image straight into the modal (Ctrl+V) while it's open. The
+  // global keydown handler yields (skips its own preventDefault) so this
+  // native "paste" event actually fires.
+  useEffect(() => {
+    if (!importOpen) return;
+    const onPaste = (e: ClipboardEvent) => {
+      const items = e.clipboardData?.items;
+      if (!items) return;
+      for (const it of items) {
+        if (it.type.startsWith("image/")) {
+          const f = it.getAsFile();
+          if (f) { e.preventDefault(); openImportFile(f); }
+          return;
+        }
+      }
+    };
+    window.addEventListener("paste", onPaste);
+    return () => window.removeEventListener("paste", onPaste);
+  }, [importOpen, openImportFile]);
 
   // Close the modal and drop the loaded image so each open starts fresh.
   const closeImport = useCallback(() => { setImportOpen(false); setImportImg(null); }, []);
@@ -2385,26 +2632,38 @@ export function DotArtTool() {
     setImportOpen(false); setImportImg(null);
   }, [importDims, previewDots, importCell, commitDots]);
 
-  // Render the preview dots into the modal's canvas (fit to a fixed box).
+  // Render the preview dots into the modal's canvas — sized to fill whatever
+  // room the preview box actually has (ResizeObserver-driven, dpr-scaled for
+  // crispness) rather than a fixed box, since the modal itself can now be
+  // resized (80vw/80vh) and the box grows/shrinks with the viewport.
   useEffect(() => {
-    const cv = importPreviewRef.current;
-    if (!cv || !importDims) return;
-    const BOX = 420;
-    const s = Math.min(BOX / importDims.pxW, BOX / importDims.pxH);
-    cv.width = Math.round(importDims.pxW * s);
-    cv.height = Math.round(importDims.pxH * s);
-    const ctx = cv.getContext("2d");
-    if (!ctx) return;
-    ctx.fillStyle = canvasBg;
-    ctx.fillRect(0, 0, cv.width, cv.height);
-    if (!previewDots) return;
-    ctx.scale(s, s);
-    for (const d of previewDots.values()) {
-      ctx.fillStyle = d.color;
-      ctx.beginPath();
-      ctx.arc(d.x, d.y, d.radius, 0, Math.PI * 2);
-      ctx.fill();
-    }
+    const cv = importPreviewRef.current, box = importPreviewBoxRef.current;
+    if (!cv || !box || !importDims) return;
+    const paint = () => {
+      const dpr = Math.min(2, window.devicePixelRatio || 1);
+      const availW = Math.max(1, box.clientWidth - 16), availH = Math.max(1, box.clientHeight - 16);
+      const s = Math.max(0.001, Math.min(availW / importDims.pxW, availH / importDims.pxH));
+      const cssW = importDims.pxW * s, cssH = importDims.pxH * s;
+      cv.width = Math.round(cssW * dpr); cv.height = Math.round(cssH * dpr);
+      cv.style.width = `${cssW}px`; cv.style.height = `${cssH}px`;
+      const ctx = cv.getContext("2d");
+      if (!ctx) return;
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.fillStyle = canvasBg;
+      ctx.fillRect(0, 0, cssW, cssH);
+      if (!previewDots) return;
+      ctx.scale(s, s);
+      for (const d of previewDots.values()) {
+        ctx.fillStyle = d.color;
+        ctx.beginPath();
+        ctx.arc(d.x, d.y, d.radius, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    };
+    paint();
+    const ro = new ResizeObserver(paint);
+    ro.observe(box);
+    return () => ro.disconnect();
   }, [previewDots, importDims, canvasBg, importOpen]);
 
   // ── Text → Dots ──
@@ -2618,18 +2877,38 @@ export function DotArtTool() {
 
   // ── Right-panel context: what the inspector currently edits ──
   const editingSelection = tool === "select" && selectedKeys.size > 0;
-  const rightCtx: "erase" | "selection" | "dot" | "grid" | "background" =
-    tool === "erase" ? "erase" : editingSelection ? "selection" : inspect;
+  const rightCtx: "erase" | "selection" | "dot" | "grid" | "background" | "array" =
+    tool === "erase" ? "erase" : tool === "array" ? "array" : editingSelection ? "selection" : inspect;
   const ctxTitle = rightCtx === "dot" && tool === "line" ? "Sparse Line"
     : rightCtx === "dot" && tool === "pen" ? "Pen Path"
       : rightCtx === "dot" && tool === "shape" ? ({ ellipse: "Ellipse", rect: "Rectangle", diamond: "Diamond", triangle: "Triangle", polygon: "Polygon" }[shapeType])
-        : { erase: "Eraser", selection: "Selection", dot: "Dot Color", grid: "Grid", background: "Background" }[rightCtx];
+        : { erase: "Eraser", selection: "Selection", dot: "Dot Color", grid: "Grid", background: "Background", array: "Array" }[rightCtx];
   const isColorCtx = rightCtx === "dot" || rightCtx === "selection";
   const activeColor = editingSelection ? selColor : color;
   const activeRadius = editingSelection ? selRadius : radius;
   const colorMixed = editingSelection && selMixed;
   const setActiveColor = (c: string) => { editingSelection ? updateSelectedDots({ color: c }) : setColor(c); pushRecentColor(c); };
   const setActiveRadius = (v: number) => { editingSelection ? updateSelectedDots({ radius: v }) : setRadius(v); };
+
+  // ── Array tool: live preview (post-snap, post-min-spacing-gate — what you
+  // see is exactly what Apply writes) ──
+  const arrayMotif = useMemo(
+    () => (tool === "array" ? (Array.from(selectedKeys).map((k) => dots.get(k)).filter((d): d is Dot => !!d)) : []),
+    [tool, selectedKeys, dots]
+  );
+  const arrayTransforms = useMemo((): Transform[] => {
+    if (arrayMotif.length === 0) return [];
+    if (arrayMode === "linear") return computeLinearInstances({ angleDeg: arrayLinearAngle, count: arrayLinearCount, spacing: arrayLinearSpacing, centered: arrayLinearCentered });
+    if (arrayMode === "grid") return computeGridInstances({ rows: arrayGridRows, cols: arrayGridCols, spacingX: arrayGridSpacingX, spacingY: arrayGridSpacingY, rowOffsetPct: arrayGridRowOffsetPct, centered: arrayGridCentered });
+    return computeCurveInstances(motifPivot(arrayMotif), { anchors: arrayCurveAnchors, curved: arrayPathCurved, count: arrayCurveCount, spacing: arrayCurveSpacing, alignToCurve: arrayCurveAlign });
+  }, [arrayMotif, arrayMode, arrayLinearAngle, arrayLinearCount, arrayLinearSpacing, arrayLinearCentered,
+      arrayGridRows, arrayGridCols, arrayGridSpacingX, arrayGridSpacingY, arrayGridRowOffsetPct, arrayGridCentered,
+      arrayCurveAnchors, arrayPathCurved, arrayCurveCount, arrayCurveSpacing, arrayCurveAlign]);
+  const arrayPreviewMap = useMemo(
+    () => computeArrayPlacements(arrayMotif, arrayTransforms, dots, snapSpacing(snapMode), minSpacing * FINE_CELL, canvasPxW, canvasPxH),
+    [arrayMotif, arrayTransforms, dots, snapMode, minSpacing, canvasPxW, canvasPxH]
+  );
+  const arrayPreview = useMemo(() => Array.from(arrayPreviewMap.values()), [arrayPreviewMap]);
   // Recolor the selection live during a picker drag, without pushing an undo snapshot every tick.
   const recolorSelectionLive = (c: string) => {
     setDots((prev) => {
@@ -2689,7 +2968,7 @@ export function DotArtTool() {
 
           {/* Tools */}
           <div>
-            <div className="grid grid-cols-6 gap-2">
+            <div className="grid grid-cols-7 gap-2">
               {([
                 { t: "select" as Tool, icon: <MousePointer2 size={20} />, label: "Select (V)" },
                 { t: "draw" as Tool, icon: <Pen size={20} />, label: "Draw (B)" },
@@ -2697,16 +2976,21 @@ export function DotArtTool() {
                 { t: "line" as Tool, icon: <Slash size={20} />, label: "Line (L)" },
                 { t: "pen" as Tool, icon: <PenTool size={20} />, label: "Pen (P)" },
                 { t: "shape" as Tool, icon: <Circle size={20} />, label: "Shape (S)" },
+                { t: "array" as Tool, icon: <Repeat size={20} />, label: "Array (A)" },
               ]).map(({ t, icon, label }) => (
                 <button key={t} title={label}
                   onClick={() => {
                     // Switching away from Pen mid-path discards the pending
                     // anchors — you can't leave a dangling path around.
                     if (tool === "pen" && t !== "pen" && penAnchorsRef.current.length > 0) cancelPenPath();
+                    // Same for Array's Curve mode.
+                    if (tool === "array" && t !== "array" && arrayCurveAnchorsRef.current.length > 0) cancelArrayCurve();
                     setTool(t);
-                    if (t === "select") sfx.toolSelect(); else if (t === "draw" || t === "line" || t === "pen" || t === "shape") sfx.toolDraw(); else sfx.toolErase();
+                    if (t === "select") sfx.toolSelect(); else if (t === "draw" || t === "line" || t === "pen" || t === "shape" || t === "array") sfx.toolDraw(); else sfx.toolErase();
                     if (t === "draw" || t === "line" || t === "pen" || t === "shape") setInspect("dot");
-                    if (t !== "select") { setSelectedKeys(new Set()); selectedKeysRef.current = new Set(); }
+                    // Array reuses the current selection as its motif, so it
+                    // joins Select as the tools that don't clear it on switch.
+                    if (t !== "select" && t !== "array") { setSelectedKeys(new Set()); selectedKeysRef.current = new Set(); }
                   }}
                   className={`aspect-square rounded-xl flex items-center justify-center transition-all ${tool === t ? "bg-[var(--solid)] text-[var(--solid-fg)]" : "bg-[var(--ctl)] text-[var(--txt-1)] hover:bg-[var(--ctl-hover)]"
                     }`}>
@@ -2834,6 +3118,13 @@ export function DotArtTool() {
             value={colorMixed ? 7 : activeRadius}
             display={colorMixed ? "—" : `${activeRadius}`}
             onChange={setActiveRadius} />
+
+          {/* Min. Spacing — absolute floor, in subgrid units, applied across
+              every placement tool (draw, brush, line, pen, shape, hand-draw) */}
+          <ValueSlider label="Min. Spacing" min={1} max={20}
+            value={minSpacing}
+            display={`${minSpacing} step${minSpacing === 1 ? "" : "s"}`}
+            onChange={setMinSpacing} />
 
           {/* Elements — pick what the right panel edits */}
           <div>
@@ -3160,6 +3451,28 @@ export function DotArtTool() {
                     </g>
                   );
                 })()}
+              </g>
+            )}
+
+            {tool === "array" && (
+              <g style={{ pointerEvents: "none" }}>
+                {arrayMode === "curve" && arrayCurveAnchors.length > 0 && (
+                  <>
+                    <polyline fill="none" stroke={color} strokeOpacity={0.4} strokeWidth={1.5 / zoom}
+                      strokeDasharray={`${6 / zoom},${4 / zoom}`}
+                      points={pathPolyline(arrayCurveCursor ? [...arrayCurveAnchors, arrayCurveCursor] : arrayCurveAnchors, arrayPathCurved)
+                        .map((p) => `${p.x},${p.y}`).join(" ")} />
+                    {arrayCurveAnchors.map((p, i) => (
+                      <circle key={i} cx={p.x} cy={p.y} r={(i === 0 && arrayCurveAnchors.length >= 2 ? 5 : 3) / zoom}
+                        fill={i === 0 && arrayCurveAnchors.length >= 2 ? "none" : color}
+                        stroke={color} strokeWidth={1.5 / zoom} />
+                    ))}
+                  </>
+                )}
+                {/* Each ghost uses its OWN color/radius, not the current brush —
+                    the motif can be multi-colored and the preview must show that
+                    faithfully (same distinction placeDots draws vs commitLineDots). */}
+                {arrayPreview.map((d) => shapeDot(d.x, d.y, d.radius, d.color, 0.4, d.key))}
               </g>
             )}
 
@@ -3563,6 +3876,154 @@ export function DotArtTool() {
             </>
           )}
 
+          {/* ── Array tool: repeat the selected motif ── */}
+          {rightCtx === "array" && (
+            <>
+              {selectedKeys.size === 0 ? (
+                <p className="text-[14px] text-[var(--txt-2)] leading-relaxed px-1">
+                  Select some dots first, then switch to Array.
+                </p>
+              ) : (
+                <>
+                  <div className="text-[13px] text-[var(--txt-3)] px-1">{selectedKeys.size} dots in motif</div>
+
+                  <div className="flex gap-2">
+                    {([
+                      { m: "linear" as ArrayMode, label: "Linear" },
+                      { m: "grid" as ArrayMode, label: "Grid" },
+                      { m: "curve" as ArrayMode, label: "Curve" },
+                    ]).map(({ m, label }) => (
+                      <button key={m} onClick={() => { setArrayMode(m); sfx.toggle(); }}
+                        className={`flex-1 py-2 rounded-xl text-[14px] transition-all ${arrayMode === m ? "bg-[var(--solid)] text-[var(--solid-fg)]" : "bg-[var(--ctl)] text-[var(--txt-1)] hover:bg-[var(--ctl-hover)]"
+                          }`}>
+                        {label}
+                      </button>
+                    ))}
+                  </div>
+
+                  {arrayMode === "linear" && (
+                    <>
+                      <div className="flex gap-2">
+                        {[0, 45, 90].map((a) => (
+                          <button key={a} onClick={() => setArrayLinearAngle(a)}
+                            className={`flex-1 py-2 rounded-xl text-[14px] transition-all ${arrayLinearAngle === a ? "bg-[var(--solid)] text-[var(--solid-fg)]" : "bg-[var(--ctl)] text-[var(--txt-1)] hover:bg-[var(--ctl-hover)]"
+                              }`}>
+                            {a}°
+                          </button>
+                        ))}
+                      </div>
+                      {/* Corner = motif is one end of the ray (grows one way).
+                          Center = motif is the midpoint (grows both ways). */}
+                      <div className="flex gap-2">
+                        {([{ v: false, label: "Corner" }, { v: true, label: "Center" }]).map(({ v, label }) => (
+                          <button key={label} onClick={() => { setArrayLinearCentered(v); sfx.toggle(); }}
+                            className={`flex-1 py-2 rounded-xl text-[14px] transition-all ${arrayLinearCentered === v ? "bg-[var(--solid)] text-[var(--solid-fg)]" : "bg-[var(--ctl)] text-[var(--txt-1)] hover:bg-[var(--ctl-hover)]"
+                              }`}>
+                            {label}
+                          </button>
+                        ))}
+                      </div>
+                      <ValueSlider label="Angle" min={0} max={360} step={5}
+                        value={arrayLinearAngle} display={`${arrayLinearAngle}°`}
+                        onChange={setArrayLinearAngle} />
+                      <ValueSlider label="Count" min={2} max={50}
+                        value={arrayLinearCount} display={`${arrayLinearCount}`}
+                        onChange={setArrayLinearCount} />
+                      <ValueSlider label="Spacing" min={10} max={300} step={5}
+                        value={arrayLinearSpacing} display={`${arrayLinearSpacing}px`}
+                        onChange={setArrayLinearSpacing} />
+                    </>
+                  )}
+
+                  {arrayMode === "grid" && (
+                    <>
+                      {/* Corner = motif is cell (row0,col0), grid grows right+down
+                          only. Center = motif's cell is the middle, grid spreads
+                          on all 4 sides. */}
+                      <div className="flex gap-2">
+                        {([{ v: false, label: "Corner" }, { v: true, label: "Center" }]).map(({ v, label }) => (
+                          <button key={label} onClick={() => { setArrayGridCentered(v); sfx.toggle(); }}
+                            className={`flex-1 py-2 rounded-xl text-[14px] transition-all ${arrayGridCentered === v ? "bg-[var(--solid)] text-[var(--solid-fg)]" : "bg-[var(--ctl)] text-[var(--txt-1)] hover:bg-[var(--ctl-hover)]"
+                              }`}>
+                            {label}
+                          </button>
+                        ))}
+                      </div>
+                      <ValueSlider label="Rows" min={1} max={20}
+                        value={arrayGridRows} display={`${arrayGridRows}`}
+                        onChange={setArrayGridRows} />
+                      <ValueSlider label="Columns" min={1} max={20}
+                        value={arrayGridCols} display={`${arrayGridCols}`}
+                        onChange={setArrayGridCols} />
+                      <ValueSlider label="Spacing X" min={10} max={300} step={5}
+                        value={arrayGridSpacingX} display={`${arrayGridSpacingX}px`}
+                        onChange={setArrayGridSpacingX} />
+                      <ValueSlider label="Spacing Y" min={10} max={300} step={5}
+                        value={arrayGridSpacingY} display={`${arrayGridSpacingY}px`}
+                        onChange={setArrayGridSpacingY} />
+                      <div className="flex gap-2">
+                        {([{ v: 0, label: "Grid" }, { v: 50, label: "Brick" }]).map(({ v, label }) => (
+                          <button key={label} onClick={() => setArrayGridRowOffsetPct(v)}
+                            className={`flex-1 py-2 rounded-xl text-[14px] transition-all ${arrayGridRowOffsetPct === v ? "bg-[var(--solid)] text-[var(--solid-fg)]" : "bg-[var(--ctl)] text-[var(--txt-1)] hover:bg-[var(--ctl-hover)]"
+                              }`}>
+                            {label}
+                          </button>
+                        ))}
+                      </div>
+                      <ValueSlider label="Row offset" min={0} max={100} step={5}
+                        value={arrayGridRowOffsetPct} display={`${arrayGridRowOffsetPct}%`}
+                        onChange={setArrayGridRowOffsetPct} />
+                    </>
+                  )}
+
+                  {arrayMode === "curve" && (
+                    <>
+                      <p className="text-[13px] text-[var(--txt-2)] leading-relaxed px-1">
+                        Click on the canvas to draw a path. Backspace undoes a point, Escape clears it.
+                      </p>
+                      <div className="text-[13px] text-[var(--txt-3)] px-1">{arrayCurveAnchors.length} points</div>
+                      <ValueSlider label="Count" min={2} max={100}
+                        value={arrayCurveCount} display={`${arrayCurveCount}`}
+                        onChange={setArrayCurveCount} />
+                      <ValueSlider label="Spacing" min={10} max={300} step={5}
+                        value={arrayCurveSpacing} display={`${arrayCurveSpacing}px`}
+                        onChange={setArrayCurveSpacing} />
+                      <div className="flex gap-2">
+                        {([{ c: false, label: "Straight" }, { c: true, label: "Curved" }]).map(({ c, label }) => (
+                          <button key={label} onClick={() => { setArrayPathCurved(c); sfx.toggle(); }}
+                            className={`flex-1 py-2 rounded-xl text-[14px] transition-all ${arrayPathCurved === c ? "bg-[var(--solid)] text-[var(--solid-fg)]" : "bg-[var(--ctl)] text-[var(--txt-1)] hover:bg-[var(--ctl-hover)]"
+                              }`}>
+                            {label}
+                          </button>
+                        ))}
+                      </div>
+                      <div className="flex gap-2">
+                        {([{ v: false, label: "Free" }, { v: true, label: "Follow curve" }]).map(({ v, label }) => (
+                          <button key={label} onClick={() => { setArrayCurveAlign(v); sfx.toggle(); }}
+                            className={`flex-1 py-2 rounded-xl text-[14px] transition-all ${arrayCurveAlign === v ? "bg-[var(--solid)] text-[var(--solid-fg)]" : "bg-[var(--ctl)] text-[var(--txt-1)] hover:bg-[var(--ctl-hover)]"
+                              }`}>
+                            {label}
+                          </button>
+                        ))}
+                      </div>
+                      {arrayCurveAnchors.length > 0 && (
+                        <button onClick={() => { cancelArrayCurve(); sfx.toggle(); }}
+                          className="w-full py-2.5 rounded-xl bg-[var(--ctl)] text-[var(--txt-1)] text-[13px] hover:bg-[var(--ctl-hover)] transition-all">
+                          Clear points
+                        </button>
+                      )}
+                    </>
+                  )}
+
+                  <button onClick={applyArray} disabled={arrayPreview.length === 0}
+                    className="w-full py-3 rounded-xl bg-[var(--solid)] text-[var(--solid-fg)] text-[15px] font-medium disabled:opacity-40 transition-all">
+                    Apply{arrayPreview.length > 0 ? ` (${arrayPreview.length} dots)` : ""}
+                  </button>
+                </>
+              )}
+            </>
+          )}
+
           {/* ── Grid editor ── */}
           {rightCtx === "grid" && (
             <>
@@ -3655,7 +4116,7 @@ export function DotArtTool() {
 
           {/* Image / Text → dots: each opens a modal to tune, preview, then commit */}
           <div className="flex gap-2">
-            <button onClick={() => { setImportCell(cellPhysical); setImportOpen(true); }} title="Convert an image into editable dots"
+            <button onClick={openImportModal} title="Convert an image into editable dots"
               className="flex-1 flex items-center justify-center gap-1.5 py-2.5 rounded-xl bg-[var(--ctl)] text-[var(--txt-1)] text-[13px] hover:bg-[var(--ctl-hover)] transition-colors">
               <ImagePlus size={13} /> Image
             </button>
@@ -3716,50 +4177,45 @@ export function DotArtTool() {
         <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/50 p-4"
           onClick={closeImport}>
           <div onClick={(e) => e.stopPropagation()}
-            className="dotart bg-[var(--card)] text-[var(--txt-1)] rounded-3xl p-5 w-full max-w-[760px] max-h-[90vh] overflow-auto flex flex-col gap-4 shadow-2xl">
-            <div className="flex items-center justify-between">
+            className="dotart bg-[var(--card)] text-[var(--txt-1)] rounded-3xl p-5 w-[80vw] h-[80vh] max-w-[1600px] max-h-[92vh] flex flex-col gap-4 shadow-2xl">
+            <div className="flex items-center justify-between shrink-0">
               <h2 className="text-[16px] font-medium flex items-center gap-2"><ImagePlus size={16} /> Import Image</h2>
               <button onClick={closeImport}
                 className="px-3 py-1.5 rounded-lg bg-[var(--ctl)] text-[13px] hover:bg-[var(--ctl-hover)]">Close</button>
             </div>
 
-            <div className="flex flex-col sm:flex-row gap-4">
+            <div className="flex flex-col sm:flex-row gap-4 flex-1 min-h-0">
               {/* Preview */}
-              <div className="flex-1 min-w-0">
-                <div className="rounded-2xl bg-[var(--ctl)] p-2 flex items-center justify-center min-h-[260px]"
-                  style={{ minHeight: 260 }}>
+              <div className="flex-1 min-w-0 min-h-0 flex flex-col">
+                <div ref={importPreviewBoxRef} className="rounded-2xl bg-[var(--ctl)] p-2 flex items-center justify-center flex-1 min-h-0">
                   {importImg
-                    ? <canvas ref={importPreviewRef} className="max-w-full max-h-[60vh] rounded-lg" />
-                    : <span className="text-[13px] text-[var(--txt-3)]">Choose an image to preview</span>}
+                    ? <canvas ref={importPreviewRef} className="rounded-lg" />
+                    : <span className="text-[13px] text-[var(--txt-3)]">Choose an image to preview — or paste one, Ctrl+V</span>}
                 </div>
                 <button onClick={() => imageInputRef.current?.click()}
-                  className="mt-2 w-full py-2.5 rounded-xl bg-[var(--ctl)] text-[13px] hover:bg-[var(--ctl-hover)]">
+                  className="mt-2 w-full py-2.5 rounded-xl bg-[var(--ctl)] text-[13px] hover:bg-[var(--ctl-hover)] shrink-0">
                   {importImg ? "Choose a different image…" : "Choose image…"}
                 </button>
                 <input ref={imageInputRef} type="file" accept="image/*" className="hidden"
                   onChange={(e) => { const f = e.target.files?.[0]; if (f) openImportFile(f); e.target.value = ""; }} />
               </div>
 
-              {/* Controls */}
-              <div className="w-full sm:w-[260px] shrink-0 flex flex-col gap-4">
+              {/* Controls — grouped into Style / Appearance / Canvas, each its
+                  own section so the modal reads as a sequence of decisions
+                  (what colors → how dots look → what canvas they land on)
+                  rather than one flat stack of fields. */}
+              <div className="w-full sm:w-[340px] shrink-0 overflow-y-auto pr-1 flex flex-col gap-5">
                 <div>
-                  <div className="text-[12px] text-[var(--txt-3)] mb-1.5">Style</div>
+                  <div className="text-[13px] font-medium text-[var(--txt-2)] tracking-[-0.3px] mb-2">Style</div>
                   <div className="flex gap-1">
-                    {([["color", "Color"], ["mono", "Mono"], ["tonal", "Light & Shadow"]] as const).map(([s, lbl]) => (
-                      <button key={s} onClick={() => setTraceStyle(s)}
-                        className={`flex-1 py-1.5 px-1 rounded-lg text-[11px] leading-tight transition-colors ${traceStyle === s ? "bg-[var(--solid)] text-white" : "bg-[var(--ctl)] text-[var(--txt-2)] hover:bg-[var(--ctl-hover)]"}`}>
+                    {([["palette", "Colors"], ["tonal", "Light & Shadow"]] as const).map(([s, lbl]) => (
+                      <button key={s} onClick={() => setImgStyle(s)}
+                        className={`flex-1 py-1.5 px-1 rounded-lg text-[11px] leading-tight transition-colors ${imgStyle === s ? "bg-[var(--solid)] text-white" : "bg-[var(--ctl)] text-[var(--txt-2)] hover:bg-[var(--ctl-hover)]"}`}>
                         {lbl}
                       </button>
                     ))}
                   </div>
-                  {traceStyle === "mono" && (
-                    <label className="flex items-center gap-2 mt-2 text-[12px] text-[var(--txt-2)]">
-                      Dot color
-                      <input type="color" value={color} onChange={(e) => { setColor(e.target.value); colorRef.current = e.target.value; }}
-                        className="w-8 h-6 rounded cursor-pointer bg-transparent" />
-                    </label>
-                  )}
-                  {traceStyle === "tonal" && (
+                  {imgStyle === "tonal" && (
                     <label className="flex items-center gap-2 mt-2 text-[12px] text-[var(--txt-2)] cursor-pointer">
                       <input type="checkbox" checked={traceTonalColor}
                         onChange={(e) => setTraceTonalColor(e.target.checked)}
@@ -3768,65 +4224,116 @@ export function DotArtTool() {
                     </label>
                   )}
                   <p className="text-[11px] text-[var(--txt-3)] leading-snug mt-1.5">
-                    {traceStyle === "color" ? "Each dot uses the image's color."
-                      : traceStyle === "mono" ? "All dots one color, uniform size."
-                        : traceTonalColor ? "Image-colored dots sized by tone — shadows big, highlights small."
-                          : "Gray dots sized by tone — shadows big, highlights small."}
+                    {imgStyle === "palette" ? "Image colors reduced to an editable palette."
+                      : traceTonalColor ? "Image-colored dots sized by tone — shadows big, highlights small."
+                        : "Gray dots sized by tone — shadows big, highlights small."}
                   </p>
+
+                  {imgStyle === "palette" && (
+                    <div className="mt-3">
+                      <ValueSlider label="Colors" min={1} max={32} step={1} value={traceColorCount}
+                        display={`${traceColorCount}`} onChange={setTraceColorCount} />
+                      {basePalette && effectivePalette && (
+                        <>
+                          <div className="flex flex-wrap gap-1.5 mt-2.5">
+                            {basePalette.palette.map((originalHex, i) => {
+                              const current = effectivePalette[i];
+                              const edited = current !== originalHex;
+                              return (
+                                <div key={i} title={`${basePalette.counts[i]} dots`}
+                                  className={`relative w-8 h-8 rounded-lg overflow-hidden border ${edited ? "ring-2 ring-[var(--solid)] border-transparent" : "border-[var(--overlay-border)]"}`}
+                                  style={{ background: current }}>
+                                  <input type="color" value={current}
+                                    onChange={(e) => setPaletteEdits((p) => ({ ...p, [originalHex]: e.target.value }))}
+                                    className="absolute inset-0 w-full h-full opacity-0 cursor-pointer" />
+                                </div>
+                              );
+                            })}
+                          </div>
+                          <p className="text-[11px] text-[var(--txt-3)] leading-snug mt-1.5">
+                            Click a swatch to replace that color everywhere. {basePalette.palette.length} colors · {previewDots?.size ?? 0} dots
+                          </p>
+                        </>
+                      )}
+                    </div>
+                  )}
                 </div>
 
-                <label className="flex items-center gap-2 text-[12px] text-[var(--txt-2)]">
-                  <span className="w-16 shrink-0">Dot size</span>
-                  <input type="range" min={2} max={20} step={0.5} value={traceDotSize}
-                    onChange={(e) => setTraceDotSize(parseFloat(e.target.value))}
-                    className="flex-1 accent-[var(--solid)]" />
-                  <span className="w-8 text-right tabular-nums">{traceDotSize}</span>
-                </label>
+                <div className="pt-4 border-t border-[var(--overlay-border)]">
+                  <div className="text-[13px] font-medium text-[var(--txt-2)] tracking-[-0.3px] mb-2">Appearance</div>
+                  <div className="flex flex-col gap-2.5">
+                    <ValueSlider label="Dot size" min={2} max={20} step={0.5} value={traceDotSize}
+                      display={`${traceDotSize}`} onChange={setTraceDotSize} />
+                    <ValueSlider label={imgStyle === "tonal" ? "Shadow" : "Density"} min={0} max={1} step={0.01} value={traceThreshold}
+                      display={traceThreshold.toFixed(2)} onChange={setTraceThreshold} />
+                    <ValueSlider label="Min. Spacing" min={1} max={20} step={1} value={minSpacing}
+                      display={`${minSpacing} step${minSpacing === 1 ? "" : "s"}`} onChange={setMinSpacing} />
+                  </div>
+                </div>
 
-                <label className="flex items-center gap-2 text-[12px] text-[var(--txt-2)]">
-                  <span className="w-16 shrink-0">{traceStyle === "tonal" ? "Shadow" : "Density"}</span>
-                  <input type="range" min={0} max={1} step={0.01} value={traceThreshold}
-                    onChange={(e) => setTraceThreshold(parseFloat(e.target.value))}
-                    className="flex-1 accent-[var(--solid)]" />
-                  <span className="w-8 text-right tabular-nums">{traceThreshold.toFixed(2)}</span>
-                </label>
-
-                {(() => {
-                  const longPhys = Math.max(canvasPhysW, canvasPhysH) || 1;
-                  const minCell = longPhys / 100, maxCell = longPhys / 8;
-                  const cell = Math.min(Math.max(importCell, minCell), maxCell);
-                  return (
-                    <label className="flex items-center gap-2 text-[12px] text-[var(--txt-2)]">
-                      <span className="w-16 shrink-0">Cell size</span>
-                      <input type="range" min={minCell} max={maxCell} step={(maxCell - minCell) / 200} value={cell}
-                        onChange={(e) => setImportCell(parseFloat(e.target.value))}
-                        className="flex-1 accent-[var(--solid)]" />
-                      <span className="w-14 text-right tabular-nums">{importCell.toFixed(1)}{unit}</span>
-                    </label>
-                  );
-                })()}
-
-                <div>
-                  <div className="text-[12px] text-[var(--txt-3)] mb-1.5">Sub-cell fill</div>
-                  <div className="flex gap-1">
-                    {([["corner", "Coarse"], ["both", "Fine"], ["fine", "Sub-grid"]] as const).map(([s, lbl]) => (
-                      <button key={s} onClick={() => setTraceDetail(s)}
-                        className={`flex-1 py-1.5 rounded-lg text-[12px] transition-colors ${traceDetail === s ? "bg-[var(--solid)] text-white" : "bg-[var(--ctl)] text-[var(--txt-2)] hover:bg-[var(--ctl-hover)]"}`}>
-                        {lbl}
-                      </button>
+                <div className="pt-4 border-t border-[var(--overlay-border)]">
+                  <div className="text-[13px] font-medium text-[var(--txt-2)] tracking-[-0.3px] mb-2">Canvas</div>
+                  <div className="flex items-center justify-between mb-1.5">
+                    <span className="text-[12px] text-[var(--txt-3)]">Size</span>
+                    <button onClick={matchImageRatio} disabled={!importImg}
+                      className="text-[11px] text-[var(--txt-2)] underline underline-offset-2 hover:text-[var(--txt-1)] disabled:opacity-40 disabled:cursor-not-allowed disabled:no-underline">
+                      Match image ratio
+                    </button>
+                  </div>
+                  <div className="flex gap-2">
+                    {([
+                      { label: "W", value: importWInput, onChange: setImportWInput, onCommit: commitImportW },
+                      { label: "H", value: importHInput, onChange: setImportHInput, onCommit: commitImportH },
+                    ]).map(({ label, value, onChange, onCommit }) => (
+                      <div key={label} className="flex-1 flex items-center gap-1.5 bg-[var(--ctl)] rounded-lg px-2 py-1.5">
+                        <span className="text-[12px] text-[var(--txt-2)] shrink-0">{label}</span>
+                        <input type="number" min="0" step="any" value={value}
+                          onChange={(e) => onChange(e.target.value)} onBlur={onCommit}
+                          onFocus={(e) => e.target.select()}
+                          onKeyDown={(e) => { if (e.key === "Enter") { onCommit(); (e.target as HTMLInputElement).blur(); } }}
+                          className="w-full min-w-0 bg-transparent text-[12px] text-[var(--txt-1)] text-right focus:outline-none [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none" />
+                      </div>
                     ))}
+                    <span className="self-center text-[12px] text-[var(--txt-3)]">{unit}</span>
                   </div>
                   <p className="text-[11px] text-[var(--txt-3)] leading-snug mt-1.5">
-                    {importDims ? `${importDims.cols}×${importDims.rows} cells` : "—"} · {previewDots ? `${previewDots.size} dots` : "—"}. Smaller cell = finer grid.
+                    → {importDims.physW}×{importDims.physH}{unit} · {importDims.cols}×{importDims.rows} cells
                   </p>
+
+                  <div className="mt-3">
+                    {(() => {
+                      const longPhys = Math.max(importW, importH) || 1;
+                      const minCell = longPhys / 100, maxCell = longPhys / 8;
+                      const cell = Math.min(Math.max(importCell, minCell), maxCell);
+                      return (
+                        <ValueSlider label="Cell size" min={minCell} max={maxCell} step={(maxCell - minCell) / 200} value={cell}
+                          display={`${importCell.toFixed(1)}${unit}`} onChange={setImportCell} />
+                      );
+                    })()}
+                  </div>
+
+                  <div className="mt-3">
+                    <div className="text-[12px] text-[var(--txt-3)] mb-1.5">Sub-cell fill</div>
+                    <div className="flex gap-1">
+                      {([["corner", "Coarse"], ["both", "Fine"], ["fine", "Sub-grid"]] as const).map(([s, lbl]) => (
+                        <button key={s} onClick={() => setTraceDetail(s)}
+                          className={`flex-1 py-1.5 rounded-lg text-[12px] transition-colors ${traceDetail === s ? "bg-[var(--solid)] text-white" : "bg-[var(--ctl)] text-[var(--txt-2)] hover:bg-[var(--ctl-hover)]"}`}>
+                          {lbl}
+                        </button>
+                      ))}
+                    </div>
+                    <p className="text-[11px] text-[var(--txt-3)] leading-snug mt-1.5">
+                      {importDims ? `${importDims.cols}×${importDims.rows} cells` : "—"} · {previewDots ? `${previewDots.size} dots` : "—"}. Smaller cell = finer grid.
+                    </p>
+                  </div>
                 </div>
               </div>
             </div>
 
-            <div className="flex justify-end gap-2 pt-1">
+            <div className="flex justify-end gap-2 pt-1 shrink-0">
               <button onClick={closeImport}
                 className="px-4 py-2.5 rounded-xl bg-[var(--ctl)] text-[13px] hover:bg-[var(--ctl-hover)]">Cancel</button>
-              <button onClick={addImportToCanvas} disabled={!previewDots}
+              <button onClick={addImportToCanvas} disabled={!previewDots || previewDots.size === 0}
                 className="px-5 py-2.5 rounded-xl bg-[var(--solid)] text-white text-[13px] disabled:opacity-40 disabled:cursor-not-allowed hover:opacity-90">
                 Add to canvas
               </button>

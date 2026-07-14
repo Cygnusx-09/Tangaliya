@@ -1,5 +1,4 @@
-// path.ts — the shared Line/Pen spacing engine, extracted verbatim from
-// DotArtTool.tsx (module scope, no React/ref coupling — see ARCHITECTURE.md).
+// path.ts — the shared Line/Pen spacing engine. Pure, no React.
 
 import type { SnapMode } from "@/lib/dots";
 import { getNearestSnap, snapSpacing } from "@/lib/snap";
@@ -107,10 +106,9 @@ export function densityAt(shape: SpacingShape, t: number, a: number, count: numb
 // the active snap mode's lattice — deduped by key, so a very short path
 // collapses to just its start.
 //
-// GAP-SPACE (the fix for "ramp/taper/pulse look even", 2026-07-08): the density
-// curve is realized as whole-lattice-step GAPS — the same trick the old
-// arithmetic model used, and the reason it visibly worked while the earlier
-// continuous-position-then-snap version didn't. A density curve computed in
+// GAP-SPACE: the density curve is realized as whole-lattice-step GAPS, never
+// as continuous positions snapped afterward — that variant looks even and
+// must not come back. A density curve computed in
 // px-space produces fractional gaps (e.g. 14px on a 20px lattice); snapping
 // each position to the coarse lattice independently then quantizes the
 // variation away (worst case `corner` mode + small spacing → average gap is

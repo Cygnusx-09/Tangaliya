@@ -1,7 +1,6 @@
 // scene.ts — the editable project file format (SceneFile/Layer/undo snapshot
 // types + serialization), unit conversion, and buildSVGString (the single
-// source of truth for every export). Extracted verbatim from DotArtTool.tsx
-// (module scope, no React/ref coupling — see ARCHITECTURE.md).
+// source of truth for every export). Pure, no React.
 
 import type { Dot, SnapMode } from "@/lib/dots";
 import { GRID_SUBDIV } from "@/lib/snap";
@@ -51,6 +50,7 @@ export interface SceneFile {
   snapReach: number;
   eraseRadius: number;
   recentColors: string[];
+  minSpacing?: number; // absolute min distance between dots, in subgrid units — optional for back-compat with pre-existing files
 }
 
 // Light structural validation — never trust a file/localStorage blob.

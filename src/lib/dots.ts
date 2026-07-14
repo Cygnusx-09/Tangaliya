@@ -87,15 +87,29 @@ export function computeImportDims(iw: number, ih: number, longPhys: number, cell
   };
 }
 
-// Sample an image on the grid into editable dots. style: "color" (image RGB) |
-// "mono" (one color) | "tonal" (grayscale halftone, dot SIZE follows brightness).
-export function buildDotsFromImage(
-  bitmap: ImageBitmap, w: number, h: number,
-  opts: { style: "color" | "mono" | "tonal"; threshold: number; dotRadius: number; snapMode: SnapMode; monoColor: string; tonalColor?: boolean }
-): Map<string, Dot> {
-  const SIZE_GAMMA = 1.6, MIN_DOT = 0.12;
+// Direct W×H -> grid at a given cell size (canvas must land on whole cells).
+// Sibling to computeImportDims above, but takes an explicit target size
+// instead of deriving it from a source image's aspect ratio.
+export function computeCanvasDims(physW: number, physH: number, cellPhysical: number) {
+  const cols = Math.max(1, Math.round(physW / cellPhysical));
+  const rows = Math.max(1, Math.round(physH / cellPhysical));
+  return {
+    cols, rows,
+    pxW: cols * CELL_SIZE, pxH: rows * CELL_SIZE,
+    physW: +(cols * cellPhysical).toFixed(2), physH: +(rows * cellPhysical).toFixed(2),
+  };
+}
+
+// One grid point's raw sample: position + RGB + luminance (0..1), before any
+// style/threshold decision is applied. Shared by buildDotsFromImage (which
+// applies style/threshold per point below) and palette.ts's buildPaletteDots
+// (which needs full RGB across all points before it can quantize).
+export interface GridSample { key: string; x: number; y: number; r: number; g: number; b: number; lum: number }
+
+// Sample an image on the snap-mode's lattice, one sample per grid point.
+export function sampleImageGrid(bitmap: ImageBitmap, w: number, h: number, snapMode: SnapMode): GridSample[] {
   const W = Math.round(w), H = Math.round(h);
-  const out = new Map<string, Dot>();
+  const out: GridSample[] = [];
   if (W <= 0 || H <= 0) return out;
 
   // Sample on an AREA average, not a single pixel: downscale the cover-fit image
@@ -105,7 +119,7 @@ export function buildDotsFromImage(
   // "fine" mode samples at FINE_CELL resolution (5x finer than half-cell) so the
   // extra dot density actually captures more image detail, not just the same
   // half-cell texel repeated at higher dot count.
-  const step = opts.snapMode === "fine" ? FINE_CELL : HALF_CELL;
+  const step = snapMode === "fine" ? FINE_CELL : HALF_CELL;
   const sw = Math.round(W / step) + 1;   // sample-grid columns (matches generateGridPoints bounds)
   const sh = Math.round(H / step) + 1;   // sample-grid rows
   const off = document.createElement("canvas");
@@ -121,23 +135,39 @@ export function buildDotsFromImage(
   ctx.drawImage(bitmap, (sw - iw * scale) / 2, (sh - ih * scale) / 2, iw * scale, ih * scale);
   const data = ctx.getImageData(0, 0, sw, sh).data;
 
-  for (const p of generateGridPoints(opts.snapMode, W, H)) {
+  for (const p of generateGridPoints(snapMode, W, H)) {
     const sx = Math.min(sw - 1, Math.max(0, Math.round(p.x / step)));
     const sy = Math.min(sh - 1, Math.max(0, Math.round(p.y / step)));
     const i = (sy * sw + sx) * 4;
     const r = data[i], g = data[i + 1], b = data[i + 2];
     const lum = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255;
+    out.push({ key: p.key, x: p.x, y: p.y, r, g, b, lum });
+  }
+  return out;
+}
+
+// Sample an image on the grid into editable dots. style: "color" (image RGB) |
+// "mono" (one color) | "tonal" (grayscale halftone, dot SIZE follows brightness).
+export function buildDotsFromImage(
+  bitmap: ImageBitmap, w: number, h: number,
+  opts: { style: "color" | "mono" | "tonal"; threshold: number; dotRadius: number; snapMode: SnapMode; monoColor: string; tonalColor?: boolean }
+): Map<string, Dot> {
+  const SIZE_GAMMA = 1.6, MIN_DOT = 0.12;
+  const out = new Map<string, Dot>();
+
+  for (const s of sampleImageGrid(bitmap, w, h, opts.snapMode)) {
+    const { key, x, y, r, g, b, lum } = s;
     if (opts.style === "tonal") {
       const ink = 1 - lum;
       if (ink < opts.threshold) continue;        // skip highlights
       const gray = Math.round(lum * 255);
       const color = opts.tonalColor ? rgbToHex(r, g, b) : rgbToHex(gray, gray, gray);
-      out.set(p.key, { key: p.key, x: p.x, y: p.y, color,
+      out.set(key, { key, x, y, color,
         radius: opts.dotRadius * (MIN_DOT + (1 - MIN_DOT) * Math.pow(ink, SIZE_GAMMA)) });
     } else {
       if (lum > opts.threshold) continue;         // skip light/background
       const color = opts.style === "color" ? rgbToHex(r, g, b) : opts.monoColor;
-      out.set(p.key, { key: p.key, x: p.x, y: p.y, color, radius: opts.dotRadius });
+      out.set(key, { key, x, y, color, radius: opts.dotRadius });
     }
   }
   return out;

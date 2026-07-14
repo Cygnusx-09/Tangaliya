@@ -93,9 +93,11 @@ tool/handler reads/writes `dots` exactly as before — it lands in whichever
 layer is active automatically. The composite SVG render draws
 `layers.map(...)` bottom→top; selection/hover/drag only apply to the active
 layer. `flattenLayers` (`src/lib/scene.ts`) merges every visible layer for
-image export and the back-compat flat `dots` field in `SceneFile` — a
-top layer's dot wins on a shared snap point, since layers can overlap (the
-"one dot per point" invariant is per-layer, not global).
+image export and the back-compat flat `dots` field in `SceneFile` — a top
+layer's dot wins on a shared snap point, since layers can overlap (the
+"one dot per point" invariant is per-layer, not global). `sceneToLayers(scene)`
+prefers `scene.layers` when present, and otherwise migrates an older
+flat-`dots` file into a single `"Layer 1"`.
 
 ## Export and the project file
 
@@ -112,6 +114,59 @@ the viewport instead. `saveProject`/`openProjectFile` round-trip a
 `.json` file; a 400ms-debounced autosave writes the same shape to
 `localStorage`, restored once at mount before first paint. Bump
 `PROJECT_VERSION` and handle migration in `parseScene` if the shape changes.
+
+## Image import: palette quantization and explicit canvas size
+
+The Import Image modal's "Colors" style (`src/lib/palette.ts`, `buildPaletteDots`)
+replaced the old Color/Mono buttons with an editable **median-cut palette**.
+`medianCutPalette` recursively splits the RGB sample cloud at the median of
+its widest channel until N boxes exist — deterministic (same image + same
+slider value always yields the same palette, so scrubbing the Colors slider
+back and forth never flickers) and O(n log n), no dependency. Above 4096
+samples it quantizes on a uniform-stride subsample for speed, but always
+does the final per-point nearest-color assignment (`nearestPaletteIndex`)
+against the **full** survivor set, so dot placement itself is never
+downsampled. The resulting palette is population-ordered (most-used first)
+and deduped by hex — it can legitimately come back shorter than the
+requested Colors count.
+
+**Recolor without re-quantizing.** `buildPaletteDots` returns `{ dots,
+palette, index, counts }` — `index` maps every dot's key to its palette
+slot. Editing a swatch never touches `medianCutPalette` again: an
+`effectivePalette` memo (`basePalette.palette.map(c => paletteEdits[c] ??
+c)`) applies the edits, and `previewDots` does an O(dots) walk that reuses
+each `Dot` object unchanged unless its slot's color actually changed — so an
+untouched palette produces byte-identical `Dot` references (cheap, and lets
+React bail out of re-rendering dots that didn't move). `paletteEdits` is
+keyed by the **original quantized hex**, not the slot index, specifically so
+an edit survives a Dot-size/Density/Colors recompute: as long as that same
+hex reappears in the new quantization (likely, since the underlying image
+didn't change), the edit still applies. It resets only on modal open and on
+loading a new/different/pasted image — not on every recompute.
+
+**Explicit canvas size.** The modal has its own `importW`/`importH`
+override (seeded from the live canvas when the modal opens via
+`openImportModal`), decoupled from `computeImportDims`'s old
+aspect-derived-from-the-image sizing. `computeCanvasDims` (`src/lib/dots.ts`,
+a sibling to `computeImportDims`) turns a direct W×H + cell size into a grid
+— since the canvas must land on whole cells, the effective physical size can
+shift slightly from what was typed (21cm at a 2cm cell rounds to 22cm), which
+is why the modal shows a live `→ W×H · cols×rows cells` readout rather than
+trusting the typed value silently. "Match image ratio" is the one-click way
+back to the old aspect-fit behavior; Cancel never touches the live canvas,
+only "Add to canvas" does (still going through the same `commitDots` both
+modals share).
+
+**Ctrl+V yields while the modal is open.** The global keydown handler's
+Ctrl+V branch (the existing dot-clipboard paste) checks an `importOpenRef`
+mirror of `importOpen` first and returns *before* calling
+`e.preventDefault()` — skipping preventDefault matters, because Chromium
+suppresses the browser's own native `paste` event for a Ctrl+V whose keydown
+already had its default prevented. The modal's own `window`-level `"paste"`
+listener (mounted only while `importOpen`) depends on that native event
+reaching it, and calls `openImportFile` for the first image item it finds in
+the clipboard, ignoring non-image items so a real paste-as-text into the
+W/H fields still works normally.
 
 ## Touch / iPad
 
@@ -148,15 +203,192 @@ gentle ramps — an intentional trilemma resolution: {smooth · on-grid ·
 arbitrary shapes}, pick two. On-grid was non-negotiable (it's a counted
 craft), so smoothness is what gives.
 
-## Why the component isn't split further (yet)
+## Keyboard shortcuts, stray focus, and the delete-selection bug
 
-`DotArtTool.tsx` is still ~3,900 lines after extracting everything pure.
+Two separate hazards live here; both were suspects in the same
+"marquee-select, press Delete, nothing happens, no console error" bug.
+
+**Stray focus (real hazard, not the bug).** `handlePointerDown` calls
+`e.preventDefault()` on every canvas click (needed to stop native
+touch-scroll/text-selection while drawing). `preventDefault()` on
+`pointerdown`/`mousedown` also suppresses the browser's *implicit*
+focus-shift-to-clicked-element behavior. So typing into any text field
+(cell size, canvas W/H, a hex color, a layer-rename input, ...) and then
+clicking the canvas does **not** blur that field — `document.activeElement`
+stays pointed at it, and the global keydown handler's `typing` guard (which
+exists so shortcuts don't hijack real text editing) silently swallows
+Delete/Backspace/every single-letter tool shortcut. `handlePointerDown`
+blurs `document.activeElement` up front, before any tool-specific logic,
+whenever it's an `INPUT`/`TEXTAREA`/contenteditable.
+
+**The actual delete bug (fixed 2026-07-13, verified by headless-browser
+repro).** `deleteSelected` queued a functional state update that read
+`selectedKeysRef.current` *inside* the updater, then synchronously reset
+`selectedKeysRef.current = new Set()` on the next line. React runs
+functional updaters later, at render time — after the handler has finished
+— so the updater iterated the already-emptied ref and deleted nothing. No
+exception, no visual change beyond the selection highlight clearing. The
+fix: snapshot the Set into a local (`const keys = selectedKeysRef.current`)
+before queueing, and iterate the snapshot. The general rule: **a functional
+`setState` updater must not read a ref that the same handler reassigns
+after queueing it** — capture the value in a local first. (Sibling
+functions like `chooseColor`/`updateSelectedDots` read the same ref inside
+updaters but don't clear it afterward, which is why they never broke.)
+Diagnosis lesson: the code read as correct line-by-line across three
+sessions; what cracked it was logging `prev.size`/`next.size` *inside* the
+updater and reproducing in a scripted headless browser, which proved the
+handler ran but the deletes were no-ops.
+
+## Placement gating: an app-wide minimum spacing
+
+`farEnough(x, y, dots, minDistPx)` (`src/lib/snap.ts`) is a brute-force
+scan — deliberately not spatially indexed, since dot counts have stayed
+small enough that it hasn't needed to be — that returns false if any
+existing dot in a map is closer than `minDistPx`. Every placement path in
+the app (the Draw tool's click and brush walk, and Line/Pen/Shape's shared
+`commitLineDots`, and hand-draw) gates each new dot through
+`next.has(key) || farEnough(...)` before writing it, checked against the
+*active layer only* — layers can already overlap by design, so a
+cross-layer floor would fight that. The `next.has(key)` half of the check
+is load-bearing: without it, redrawing or recoloring an already-placed dot
+at its own exact point would get rejected as "too close to itself." The
+floor is user-tunable (the "Min. Spacing" slider, in subgrid units of
+`FINE_CELL`) but can only ever make placement *sparser* than the active
+snap mode's own lattice, never finer — in a coarse mode where a lattice
+step already exceeds the slider's distance, the gate is a no-op.
+
+**Bulk variant for image import (added 2026-07-14).** The Image modal's
+palette/tonal preview can generate up to ~10^6 candidate dots at fine detail
+(a full-canvas grid, not an interactively-drawn set), so gating each one
+through `farEnough`'s brute O(n) scan would make the whole preview O(n²) —
+fine for the low hundreds of dots a hand-drawn layer accumulates, not for a
+bulk grid. `filterMinSpacing` (`src/lib/snap.ts`) enforces the identical
+"first dot wins, in scan order" rule via a spatial hash (bucket size =
+`minDistPx`, check the 3×3 neighborhood of buckets instead of every existing
+dot) — same semantics as `farEnough`, O(n) instead of O(n²). It's a generic
+`Map<string, T extends {x,y}>` filter, applied once as the last step of the
+modal's `previewDots` memo; nothing else in the app needs this variant yet
+because nothing else places dots in bulk at this scale.
+
+A second app-wide gate lives alongside it: **canvas bounds** (edges
+inclusive — x = 0 and x = canvasW are real snap points). Most paths were
+always bounded because they snap through `getNearestSnap`, which returns
+null outside the canvas (draw clicks, hand-draw, Line/Pen/Shape outline
+via `computePathDots`), the brush walk breaks at the edge, and shape fill
+filters its scan. But four paths place or move dots through the unbounded
+`keyFromPosition` and used to leak: the Array pipeline
+(`computeArrayPlacements` now takes canvas dims and skips out-of-bounds
+placements — the ghost preview and Apply share the gate, so what you see
+is what you get), paste/duplicate (`placeDots` skips dots that won't
+fit), and select-drag / arrow-nudge. The move paths don't skip per-dot —
+that would tear a selection apart or silently delete dots at the re-key
+step — they clamp the *whole offset* with `clampOffsetToCanvas`
+(`src/lib/snap.ts`) against the selection's bounding box, so the
+selection stops flush at the wall as a unit. The clamp quantizes in
+whole lattice steps (offsets stay lattice-aligned) and never forces a
+move: if legacy dots already sit outside the canvas, zero offset remains
+legal, so they can always be dragged back in.
+
+## The Array tool: repeating a motif
+
+The Array tool (`src/lib/array.ts` for the pure geometry, wired into
+`DotArtTool.tsx` as a seventh tool) takes the current selection as "the
+motif" and repeats it — linear row, grid, or along a hand-drawn curve.
+It is **destructive, not a live modifier**: sliders drive a ghost preview,
+nothing writes to the dot map until Apply, and once applied the copies are
+ordinary dots with no memory of how they were generated. A persistent,
+re-tunable-forever array (Blender's actual modifier model) would need an
+object type living outside the flat `Map<string,Dot>` every other tool in
+this app assumes to exist — a materially bigger architecture change,
+deliberately out of scope.
+
+The design space (originally requested as five named patterns — row, grid,
+brick, diagonal, curve) collapses to three general controls, because two of
+the five are just parameter presets of the other two: **Linear** (angle +
+count + spacing — a "diagonal" is just a non-zero angle) and **Grid** (rows
++ cols + spacing X/Y + a row-offset percentage — "brick" is that percentage
+at 50%). **Curve** click-places anchors on the canvas exactly like the Pen
+tool's state machine, then walks the resulting path at constant arc-length
+steps (`pathPolyline`/`pathLength`/`pointAtArcLength`, the same engine
+behind the Spacing model above), optionally rotating each copy to the local
+tangent (sampled at `dist±ε`) — the Blender Curve-modifier behavior.
+
+Both Linear and Grid also take a **Corner/Center anchor** (reusing the
+Shape tool's existing Corner/Center vocabulary rather than inventing a new
+one): Corner is the naive formula, where the motif is instance 0 and
+every other copy is placed *ahead* of it, so the array only ever grows one
+direction; Center reframes the motif as the array's midpoint by offsetting
+each instance by `i - (count-1)/2` steps (and the 2D equivalent for Grid),
+so it spreads symmetrically. Curve mode has no such toggle, since direction
+there is just whatever path was drawn — and unlike Linear/Grid, Curve's
+"instance 0" is the curve's start anchor, not the motif's own position, so
+applying a Curve array always leaves the original motif in place and adds
+N new copies alongside it (nothing in this app deletes dots implicitly).
+
+One pipeline, `computeArrayPlacements`, serves both the live preview and
+the real commit — it rotates and translates each instance, re-snaps every
+dot to the active lattice, and gates the result through the min-spacing
+floor above, incrementally, so instances within the same Apply also count
+against each other. Because preview and commit are the same function call,
+what's on screen when Apply is clicked is exactly what gets written. The
+one real visual cost of re-snapping is that a rotated motif can visibly
+deform on coarse snap modes (worst in Corner/Center, best in Sub-grid) —
+the same lattice-locked-craft tension as the Spacing model's trilemma
+above, and, like that trilemma, the live preview shows it before commit
+rather than after.
+
+## Cross-platform downloads
+
+`src/lib/download.ts`'s `downloadBlob(blob, filename)` is the one path
+every "save a file" action (SVG/PNG/PDF export, project save) goes
+through, because plain `<a download>` clicks are not reliable on iOS
+Safari. The specific failure: WebKit stops trusting a `download` click as
+a genuine user action once it fires after an async step (an image
+`onload`, `canvas.toBlob`, a dynamic `import()`) — the click silently does
+nothing, no error. `downloadBlob` sniffs iOS and, there, routes through
+the Web Share API (`navigator.share` with a `File`) instead, which pops
+the native "Save Image"/"Save to Files" sheet and isn't sensitive to the
+same gesture-timing rule; it falls back to opening the blob in a new tab
+if Share is unavailable. Desktop and Android keep the direct blob-download
+path, unchanged.
+
+## Splitting the component: the pattern that works
+
+`DotArtTool.tsx` is still ~4,300 lines after extracting everything pure.
 Splitting the stateful remainder — handlers, refs, the ~90-ref mirroring
-surface — into hooks is a real option, but it multiplies exactly the
-operation that causes the crash class described above (moving declarations,
-creating new dependency arrays) across dozens of interlinked pieces, with
-no behavioral test coverage to catch a subtle regression. If you're
-considering it: get `typecheck` green and keep it green, add at least one
-smoke test that mounts the app and exercises a draw→undo round trip, and
-split one self-contained subsystem at a time (Layers is the best
-candidate) rather than attempting it all at once.
+surface — into hooks multiplies exactly the operation that causes the
+crash class described above (moving declarations, creating new dependency
+arrays), so it only became defensible once behavioral coverage existed:
+the smoke suite (`npm run smoke`, `tests/smoke.mjs`) drives the real app
+in headless Chrome through draw/select+delete/undo/redo/line/pen/shape/
+array/erase/layers/export. The suite is the gate — green before and after
+every extraction.
+
+The first extraction (`src/app/hooks/useLayers.ts`, 2026-07-13) sets the
+pattern for the rest:
+
+- **Move verbatim.** Callback bodies are cut-pasted, not redesigned. The
+  hook returns everything under its old names — including raw setters and
+  refs (`setLayers`, `layersRef`, `activeLayerIdRef`, `dotsRef`) — so
+  outside writers like `applyScene` and the drag-commit paths need zero
+  changes and the component-side diff is a destructure.
+- **Inject cross-cutting concerns as callbacks held in refs.** Layer
+  switches must clear the selection, but selection state stays in the
+  component — so the hook takes `clearSelection: () => void` and stores it
+  in a ref (`clearSelectionRef.current = clearSelection` every render).
+  Its `[]`-dep callbacks call through the ref, so they can never capture a
+  stale identity.
+- **Mind declaration order.** The hook call needs its arguments
+  initialized above it; `selectedKeys`/`selectedKeysRef` moved above the
+  hook call for exactly this reason. `npm run typecheck` catches the
+  use-before-declaration variants of getting this wrong.
+- **Extend the suite in the same pass** with checks that exercise the
+  moved code (the layers panel checks landed with the layers hook). A
+  test-side lesson from writing those: selection highlight rings are also
+  SVG `<circle>`s, so any dot-count assertion needs the selection cleared
+  first or a cleared-baseline count.
+
+Next best candidates, in order: the view transform (zoom/pan/rot +
+`applyViewport`/`getSVGPoint` — self-contained, no selection coupling),
+then clipboard/selection operations. The pointer handlers should go last,
+if ever — they touch everything.

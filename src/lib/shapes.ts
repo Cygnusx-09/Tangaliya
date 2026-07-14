@@ -1,16 +1,14 @@
 // shapes.ts — dot-rendering shape (bar/circle) + the Shape tool's primitives
-// (ellipse/rect/diamond/triangle/polygon outline+fill), extracted verbatim
-// from DotArtTool.tsx (module scope, no React/ref coupling — see
-// ARCHITECTURE.md).
+// (ellipse/rect/diamond/triangle/polygon outline+fill). Pure, no React.
 
 import { HALF_CELL, getKey, type SnapMode } from "@/lib/dots";
 import { FINE_CELL, getFineKey } from "@/lib/snap";
 
 // How a placed dot is drawn (position/snapping is identical either way).
-// "bar" is a 2:1 rounded rectangle — width twice its height.
+// "bar" is a 1.5:1 rounded rectangle — width 1.5× its height.
 export type DotShape = "circle" | "bar";
 export function barRect(x: number, y: number, r: number) {
-  const h = r * 1.5, w = h * 2;
+  const h = r * 1.5, w = h * 1.5;
   return { x: x - w / 2, y: y - h / 2, w, h, rx: h * 0.4 };
 }
 
