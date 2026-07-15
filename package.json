@@ -14,7 +14,8 @@
     "build": "vite build",
     "dev": "vite",
     "typecheck": "tsc --noEmit",
-    "smoke": "node tests/smoke.mjs"
+    "smoke": "node tests/smoke.mjs",
+    "perf:selection": "node tests/perf-selection.mjs"
   },
   "dependencies": {
     "@radix-ui/react-progress": "1.1.2",

@@ -34,6 +34,12 @@ Verification is:
    judge (visual correctness, feel). At minimum, run through **SMOKE-QUICK**
    below; if your change touches drawing, tools, layers, or export, run
    **SMOKE-FULL**.
+5. If your change touches dot rendering or the Select tool at scale, also run
+   `npm run perf:selection` (`tests/perf-selection.mjs`) — an optional,
+   heavier script (not part of `npm run smoke`) that builds a 30k+-dot layer
+   via image import and times a real Ctrl+A against a fixed budget. It's the
+   regression guard for the large-selection freeze fixed in `SelectionOverlay`
+   (see `ARCHITECTURE.md`).
 
 ### SMOKE-QUICK (~2 min)
 

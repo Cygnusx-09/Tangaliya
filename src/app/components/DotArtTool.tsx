@@ -32,6 +32,11 @@ import { useLayers } from "../hooks/useLayers";
 type Tool = "draw" | "erase" | "select" | "line" | "pen" | "shape" | "array";
 const MIN_ZOOM = 0.1;
 const MAX_ZOOM = 20;
+// Above this many selected dots, SelectionOverlay swaps per-dot rings for one
+// bounding-box rect — inserting thousands of ring <circle>s in one commit is
+// what freezes Ctrl+A on a large layer (see ARCHITECTURE.md). Starting guess,
+// tuned against tests/perf-selection.mjs.
+const LARGE_SELECTION_RING_THRESHOLD = 1000;
 
 // One layer's dots rendered as a single memoized SVG group. Pointermove-driven
 // state (hover, draw preview, drag) re-renders DotArtTool on every mouse move;
@@ -41,15 +46,14 @@ const MAX_ZOOM = 20;
 // layer objects keep their reference — React.memo lets an inactive layer skip
 // re-rendering entirely as long as its props stay referentially/shallowly
 // equal. That's why the call site MUST pass constant props (selectedKeys:
-// null, hoveredDotKey: null, isDragging: false, moveDx/moveDy: 0) to every
-// inactive layer instead of the live values — otherwise hover/selection/drag
-// churn on the active layer would change every layer's props and defeat the
-// memo.
-const DotLayer = memo(function DotLayer(props: {
+// null, isDragging: false, moveDx/moveDy: 0) to every inactive layer instead
+// of the live values — otherwise selection/drag churn on the active layer
+// would change every layer's props and defeat the memo. Selection/hover RINGS
+// live in the sibling SelectionOverlay component below, not here — see its
+// comment for why.
+function DotLayerImpl(props: {
   layer: Layer; isActive: boolean; dotShape: DotShape; zoom: number;
-  selectionRingColor: string;
   selectedKeys: Set<string> | null;   // null for inactive layers
-  hoveredDotKey: string | null;       // null for inactive layers
   isDragging: boolean; moveDx: number; moveDy: number;
   // Increments only for the active layer when the user switches layers via
   // the canvas nav arrows — bumps the inner <g>'s key so it remounts and
@@ -58,7 +62,7 @@ const DotLayer = memo(function DotLayer(props: {
   // layers, so it never varies for them and never breaks their memo.
   pulseKey?: number;
 }) {
-  const { layer, isActive, dotShape, zoom, selectionRingColor, selectedKeys, hoveredDotKey, isDragging, moveDx, moveDy, pulseKey } = props;
+  const { layer, isActive, dotShape, zoom, selectedKeys, isDragging, moveDx, moveDy, pulseKey } = props;
   return (
     <g key={pulseKey ?? 0} className={pulseKey ? "dotart-layer-pulse" : undefined}>
       {Array.from(layer.dots.values()).map((dot) => {
@@ -68,17 +72,6 @@ const DotLayer = memo(function DotLayer(props: {
         const cy = isDraggingThis ? dot.y + moveDy : dot.y;
         return (
           <g key={dot.key}>
-            {isSelected && (
-              <circle cx={cx} cy={cy} r={dot.radius + 4 / zoom}
-                fill="none" stroke={selectionRingColor} strokeWidth={1.5 / zoom}
-                strokeDasharray={isDragging ? `${3 / zoom},${2 / zoom}` : "none"}
-                style={{ pointerEvents: "none" }} />
-            )}
-            {isActive && hoveredDotKey === dot.key && !isSelected && (
-              <circle cx={dot.x} cy={dot.y} r={dot.radius + 4 / zoom}
-                fill="none" stroke={selectionRingColor} strokeWidth={1 / zoom} opacity={0.5}
-                style={{ pointerEvents: "none" }} />
-            )}
             {dotShape === "bar" ? (() => {
               const b = barRect(cx, cy, dot.radius);
               return <rect x={b.x} y={b.y} width={b.w} height={b.h} rx={b.rx} fill={dot.color} opacity={isDraggingThis ? 0.7 : 1} />;
@@ -88,6 +81,117 @@ const DotLayer = memo(function DotLayer(props: {
           </g>
         );
       })}
+    </g>
+  );
+}
+// Custom equality instead of memo's default shallow-prop-compare: while NOT
+// dragging, isDraggingThis is always false regardless of selectedKeys (see
+// DotLayerImpl body), so the rendered output is provably independent of
+// selectedKeys — but a plain memo() would still bail out of its bailout,
+// because Ctrl+A/marquee selection hands down a brand-new Set every time,
+// and reference inequality alone triggers React to reconcile all N dot
+// elements even though every attribute it would write is identical. That
+// full-list reconciliation (not a DOM write — the values don't change) was
+// the actual remaining cost after the ring extraction below, measured at
+// ~3.6s for 40k dots via tests/perf-selection.mjs. Ignoring selectedKeys
+// unless isDragging is true closes that gap.
+function dotLayerPropsEqual(prev: Parameters<typeof DotLayerImpl>[0], next: Parameters<typeof DotLayerImpl>[0]) {
+  if (prev.layer !== next.layer) return false;
+  if (prev.isActive !== next.isActive) return false;
+  if (prev.dotShape !== next.dotShape) return false;
+  if (prev.zoom !== next.zoom) return false;
+  if (prev.isDragging !== next.isDragging) return false;
+  if (prev.moveDx !== next.moveDx) return false;
+  if (prev.moveDy !== next.moveDy) return false;
+  if (prev.pulseKey !== next.pulseKey) return false;
+  if (next.isDragging && prev.selectedKeys !== next.selectedKeys) return false;
+  return true;
+}
+const DotLayer = memo(DotLayerImpl, dotLayerPropsEqual);
+
+// Selection + hover rings for the active layer, split out of DotLayer so that
+// flipping a huge selection (Ctrl+A on tens of thousands of dots) no longer
+// forces DotLayer's per-dot map to re-run — DotLayer's fill circles don't
+// change when only selectedKeys changes, so its memo now bails out cleanly.
+// Rendered once (not per-layer, unlike DotLayer) since only the active
+// layer's dots are ever selectable/hoverable.
+const SelectionOverlay = memo(function SelectionOverlay(props: {
+  dots: Map<string, Dot>;
+  selectedKeys: Set<string>;
+  hoveredDotKey: string | null;
+  isDragging: boolean; moveDx: number; moveDy: number;
+  zoom: number; selectionRingColor: string;
+}) {
+  const { dots, selectedKeys, hoveredDotKey, isDragging, moveDx, moveDy, zoom, selectionRingColor } = props;
+
+  // Radius-aware bbox over the selection only — kept separate from
+  // selectionBBox (used elsewhere for edge-clamping) because that helper
+  // deliberately ignores per-dot radius, which matters here since tonal
+  // image import produces varying radii and a tight box would clip rings.
+  // Memoized on [selectedKeys, dots] — moveDx/moveDy are applied as a plain
+  // offset below, not inside the memo, so dragging a huge selection doesn't
+  // recompute this every pointermove.
+  const bigSelectionBox = useMemo(() => {
+    if (selectedKeys.size <= LARGE_SELECTION_RING_THRESHOLD) return null;
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity, maxRadius = 0;
+    for (const key of selectedKeys) {
+      const dot = dots.get(key);
+      if (!dot) continue;
+      if (dot.x < minX) minX = dot.x;
+      if (dot.y < minY) minY = dot.y;
+      if (dot.x > maxX) maxX = dot.x;
+      if (dot.y > maxY) maxY = dot.y;
+      if (dot.radius > maxRadius) maxRadius = dot.radius;
+    }
+    if (minX > maxX) return null;
+    return { minX, minY, maxX, maxY, maxRadius };
+  }, [selectedKeys, dots]);
+
+  const hoverRing = hoveredDotKey && !selectedKeys.has(hoveredDotKey) && (() => {
+    const dot = dots.get(hoveredDotKey);
+    if (!dot) return null;
+    return (
+      <circle cx={dot.x} cy={dot.y} r={dot.radius + 4 / zoom}
+        fill="none" stroke={selectionRingColor} strokeWidth={1 / zoom} opacity={0.5}
+        style={{ pointerEvents: "none" }} />
+    );
+  })();
+
+  if (bigSelectionBox) {
+    const pad = bigSelectionBox.maxRadius + 4 / zoom;
+    const ox = isDragging ? moveDx : 0;
+    const oy = isDragging ? moveDy : 0;
+    return (
+      <g data-selection-overlay="">
+        <rect
+          x={bigSelectionBox.minX - pad + ox} y={bigSelectionBox.minY - pad + oy}
+          width={bigSelectionBox.maxX - bigSelectionBox.minX + pad * 2}
+          height={bigSelectionBox.maxY - bigSelectionBox.minY + pad * 2}
+          fill={selectionRingColor} fillOpacity={0.06}
+          stroke={selectionRingColor} strokeWidth={1 / zoom}
+          strokeDasharray={isDragging ? `${4 / zoom},${3 / zoom}` : "none"}
+          style={{ pointerEvents: "none" }}
+        />
+        {hoverRing}
+      </g>
+    );
+  }
+
+  return (
+    <g data-selection-overlay="">
+      {Array.from(selectedKeys).map((key) => {
+        const dot = dots.get(key);
+        if (!dot) return null;
+        const cx = isDragging ? dot.x + moveDx : dot.x;
+        const cy = isDragging ? dot.y + moveDy : dot.y;
+        return (
+          <circle key={key} cx={cx} cy={cy} r={dot.radius + 4 / zoom}
+            fill="none" stroke={selectionRingColor} strokeWidth={1.5 / zoom}
+            strokeDasharray={isDragging ? `${3 / zoom},${2 / zoom}` : "none"}
+            style={{ pointerEvents: "none" }} />
+        );
+      })}
+      {hoverRing}
     </g>
   );
 });
@@ -3194,7 +3298,7 @@ export function DotArtTool() {
         onPointerCancel={handlePointerCancel}
         onDoubleClick={handleDoubleClick}>
         <svg ref={svgRef} width={viewportSize.width} height={viewportSize.height}
-          className="absolute inset-0 select-none" style={{ cursor, touchAction: "none" }}>
+          className="absolute inset-0 select-none" style={{ touchAction: "none" }}>
 
           <rect width={viewportSize.width} height={viewportSize.height} style={{ fill: "var(--viewport)" }} />
 
@@ -3234,15 +3338,26 @@ export function DotArtTool() {
                 isActive={layer.id === activeLayerId}
                 dotShape={dotShape}
                 zoom={zoom}
-                selectionRingColor={selectionRingColor}
                 selectedKeys={layer.id === activeLayerId ? selectedKeys : null}
-                hoveredDotKey={layer.id === activeLayerId ? hoveredDotKey : null}
                 isDragging={layer.id === activeLayerId ? isDragging : false}
                 moveDx={layer.id === activeLayerId ? moveDx : 0}
                 moveDy={layer.id === activeLayerId ? moveDy : 0}
                 pulseKey={layer.id === activeLayerId ? layerPulseKey : undefined}
               />
             ))}
+
+            {(selectedKeys.size > 0 || hoveredDotKey) && (
+              <SelectionOverlay
+                dots={dots}
+                selectedKeys={selectedKeys}
+                hoveredDotKey={hoveredDotKey}
+                isDragging={isDragging}
+                moveDx={moveDx}
+                moveDy={moveDy}
+                zoom={zoom}
+                selectionRingColor={selectionRingColor}
+              />
+            )}
 
             {rulerGuide && tool === "draw" && (
               /* Magnetic-ruler rail: visible only while the stroke is locked
@@ -3489,6 +3604,17 @@ export function DotArtTool() {
               />
             )}
           </g>
+
+          {/* Must stay the LAST child of <svg> — it's the sole native
+              hit-target for cursor purposes; anything added after this point
+              will intercept pointer events meant for the canvas. Carries the
+              reactive `cursor` value instead of the <svg> root so changing it
+              doesn't force the browser to resolve inherited style across the
+              (tens-of-thousands-large) dot subtree above — see CLAUDE.md's
+              Layers section for the measured cost this avoids.
+              pointer-events:"all" makes it hit-testable despite fill="none". */}
+          <rect data-cursor-surface="" x={0} y={0} width={viewportSize.width} height={viewportSize.height}
+            fill="none" style={{ cursor, pointerEvents: "all" }} />
         </svg>
 
         {/* Layers panel (floating, top-right) */}

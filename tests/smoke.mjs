@@ -100,6 +100,15 @@ try {
   await page.mouse.move(cx + 160, cy + 160, { steps: 8 });
   await page.mouse.up();
   await page.waitForTimeout(150);
+
+  // SelectionOverlay regression guard — the data-selection-overlay marker
+  // scopes this unambiguously, replacing the old clear-then-diff workaround
+  // (rings live in their own <g> now, not mixed into DotLayer's dot circles).
+  const overlayRingCount = await page.evaluate(
+    () => document.querySelectorAll("[data-selection-overlay] circle").length
+  );
+  check("selection: SelectionOverlay renders one ring per selected dot", overlayRingCount === 5, `${overlayRingCount} rings`);
+
   await page.keyboard.press("Delete");
   await page.waitForTimeout(200);
   check("select+delete: dots removed", (await countDots()) === 0);
