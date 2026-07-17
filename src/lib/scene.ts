@@ -81,6 +81,34 @@ export function sceneToMap(scene: SceneFile | null): Map<string, Dot> {
   return dotsArrayToMap(scene?.dots);
 }
 
+// A blank document at this app's own new-document defaults — the same
+// fallbacks every `useState(boot?.field ?? default)` call in DotArtTool.tsx
+// already uses, gathered in one place for "Create New" so a fresh library
+// project matches what a fresh (no-autosave) boot has always looked like.
+export function defaultScene(): SceneFile {
+  return {
+    app: PROJECT_TAG,
+    version: PROJECT_VERSION,
+    dots: [],
+    layers: [{ id: genLayerId(), name: "Layer 1", visible: true, dots: [] }],
+    unit: "cm",
+    cellPhysical: 1,
+    canvasPhysW: 20,
+    canvasPhysH: 20,
+    canvasBg: "#ffffff",
+    gridColor: "#000000",
+    gridOpacity: 0.07,
+    gridThickness: 0.5,
+    snapMode: "fine",
+    color: "#FF2A2A",
+    radius: 1,
+    snapReach: 35,
+    eraseRadius: 8,
+    recentColors: [],
+    minSpacing: 1,
+  };
+}
+
 // The layer stack from a scene: use its `layers` if present, else migrate the
 // flat `dots` into a single "Layer 1". Always returns at least one layer.
 // Flatten visible layers to one dot array (bottom→top, so a top layer's dot

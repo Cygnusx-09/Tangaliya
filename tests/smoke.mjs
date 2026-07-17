@@ -81,8 +81,129 @@ try {
 
   const cx = 700, cy = 450;
 
-  // 1 — boot: fresh profile means a fresh document
+  const homeTileCount = () => page.locator("[data-project-tile]").count();
+  const createNewBtn = () => page.getByRole("button", { name: /create new/i });
+
+  // 1 — boot: fresh profile means a fresh document, AND — since Home now
+  // shows on cold opens (a fresh session, no sessionStorage flag yet) — it's
+  // the first thing on screen, before any interaction. Home screen checks
+  // run here while the document is still blank and the library still empty
+  // (a fresh profile has no AUTOSAVE_KEY, so the one-time migration bails
+  // without creating an entry) — keeps the tile-count assertions below exact
+  // instead of coupled to dot counts built up by the rest of the suite.
   check("boot: canvas renders, no dots", (await countDots()) === 0);
+  check("boot: Home shows on cold open", await createNewBtn().first().isVisible());
+  check("home: no tiles on a fresh, untouched document", (await homeTileCount()) === 0, `${await homeTileCount()} tiles`);
+
+  await createNewBtn().first().click();
+  await page.waitForTimeout(200);
+  check("home: Create New closes Home", !(await createNewBtn().first().isVisible().catch(() => false)));
+  check("home: Create New leaves a blank canvas", (await countDots()) === 0);
+
+  // Draw a couple of dots so the file round-trip below is meaningful.
+  await page.keyboard.press("b");
+  await page.mouse.click(cx, cy);
+  await page.mouse.click(cx + 40, cy);
+  await page.waitForTimeout(100);
+  const dotsForHomeTest = await countDots();
+
+  // Save to disk from the editor (Home is closed) — this also flushes the
+  // active project to the library, and the saved file feeds the "Open from
+  // file" round-trip further down.
+  const saveDl = page.waitForEvent("download", { timeout: 5000 }).catch(() => null);
+  await page.locator('button[title="Download an editable project file"]').click();
+  const savedDownload = await saveDl;
+  const savedPath = savedDownload ? await savedDownload.path() : null;
+  check("home: Save Project triggers a download", !!savedPath);
+
+  await page.locator('button[title="Home"]').click();
+  await page.waitForTimeout(300);
+  check("home: the flushed project shows one tile", (await homeTileCount()) === 1, `${await homeTileCount()} tiles`);
+  // Names are now auto-generated (Indian flower names, randomly picked) rather
+  // than a fixed "Untitled" string — just confirm it got a real, non-empty name.
+  const newTileName = await page.locator("[data-project-tile] .truncate").first().innerText();
+  check("home: new tile gets an auto-generated name", newTileName.trim().length > 0, newTileName);
+
+  // Rename
+  await page.locator('[data-project-tile] button[title="Rename"]').first().click();
+  await page.locator('[data-project-tile] input').first().fill("My Pattern");
+  await page.keyboard.press("Enter");
+  await page.waitForTimeout(150);
+  check("home: rename updates the tile name",
+    (await page.locator("[data-project-tile]").first().innerText()).includes("My Pattern"));
+
+  // Duplicate
+  await page.locator('[data-project-tile] button[title="Duplicate"]').first().click();
+  await page.waitForTimeout(150);
+  check("home: duplicate adds a tile", (await homeTileCount()) === 2, `${await homeTileCount()} tiles`);
+
+  // Search filters, then clears
+  await page.locator('input[placeholder="Search projects"]').fill("zzz-no-match");
+  await page.waitForTimeout(150);
+  check("home: search filters out non-matching tiles", (await homeTileCount()) === 0, `${await homeTileCount()} tiles`);
+  await page.locator('input[placeholder="Search projects"]').fill("");
+  await page.waitForTimeout(150);
+  check("home: clearing search restores tiles", (await homeTileCount()) === 2, `${await homeTileCount()} tiles`);
+
+  // Grid/list toggle — structural only, matching the suite's loose-assertion style.
+  await page.locator('button[title="List view"]').click();
+  await page.waitForTimeout(150);
+  check("home: list view renders without error", (await homeTileCount()) === 2, `${await homeTileCount()} tiles`);
+  await page.locator('button[title="Grid view"]').click();
+  await page.waitForTimeout(150);
+
+  // "Open from file" round-trip — feeds back the file saved above through
+  // Home's OWN hidden input (data-home-file-input, distinct from the editor's
+  // own "Open" input which is also in the DOM while Home is open) and checks
+  // it both loads AND registers a new library tile.
+  if (savedPath) {
+    await page.locator('input[data-home-file-input]').setInputFiles(savedPath);
+    await page.waitForTimeout(300);
+    check("home: Open from file closes Home", !(await createNewBtn().first().isVisible().catch(() => false)));
+    check("home: Open from file restores the saved dots", (await countDots()) === dotsForHomeTest, `${await countDots()}`);
+
+    await page.locator('button[title="Home"]').click();
+    await page.waitForTimeout(300);
+    check("home: Open from file registers a new tile", (await homeTileCount()) === 3, `${await homeTileCount()} tiles`);
+  } else {
+    check("home: Open from file closes Home", false, "skipped — no saved file");
+    check("home: Open from file restores the saved dots", false, "skipped — no saved file");
+    check("home: Open from file registers a new tile", false, "skipped — no saved file");
+  }
+
+  // Delete
+  const beforeDelete = await homeTileCount();
+  await page.locator('[data-project-tile] button[title="Delete"]').first().click();
+  await page.waitForTimeout(150);
+  check("home: delete removes a tile", (await homeTileCount()) === beforeDelete - 1, `${beforeDelete} -> ${await homeTileCount()}`);
+
+  // Escape closes Home without touching the canvas
+  await page.keyboard.press("Escape");
+  await page.waitForTimeout(150);
+  check("home: Escape closes Home", !(await createNewBtn().first().isVisible().catch(() => false)));
+  check("home: canvas untouched after closing Home", (await countDots()) === dotsForHomeTest, `${await countDots()}`);
+
+  // Reset to a genuinely fresh boot — the rest of this suite assumes a
+  // pristine document AND the exact view fit/pan/zoom a first boot produces,
+  // and relies on fixed screen coordinates (`cx`/`cy`) for every subsequent
+  // click. Re-creating a blank document in-app (Create New + Fit to view)
+  // gets the DOTS right but does not reliably reproduce the same pan/zoom as
+  // a true first boot — clearing storage and reloading sidesteps that
+  // entirely instead of chasing the discrepancy.
+  await page.evaluate(() => { try { localStorage.clear(); } catch { /* ignore */ } });
+  await page.evaluate(() => new Promise((resolve) => {
+    const req = indexedDB.deleteDatabase("tangaliya-projects");
+    req.onsuccess = () => resolve(); req.onerror = () => resolve(); req.onblocked = () => resolve();
+  }));
+  await page.reload({ waitUntil: "networkidle" });
+  await page.waitForSelector("svg");
+  await page.waitForTimeout(600);
+  check("home: reload after Home tests restores a blank, pristine boot", (await countDots()) === 0);
+  // sessionStorage (unlike localStorage/IndexedDB, both cleared above) survives
+  // a same-page reload, and Home was already dismissed once earlier in this
+  // session (the very first Create New click) — so this reload must land
+  // straight in the editor, not back on Home.
+  check("boot: same-session reload skips Home", !(await createNewBtn().first().isVisible().catch(() => false)));
 
   // 2 — draw tool
   await page.keyboard.press("b");
@@ -242,7 +363,7 @@ try {
 
   // 11 — SVG export triggers a download
   const dl = page.waitForEvent("download", { timeout: 5000 }).catch(() => null);
-  await page.getByRole("button", { name: /^svg$/i }).first().click();
+  await page.getByRole("button", { name: /^export svg$/i }).first().click();
   const download = await dl;
   check("export: SVG download fires", !!download && /\.svg$/i.test(download.suggestedFilename()),
     download ? download.suggestedFilename() : "no download event");
@@ -301,6 +422,15 @@ try {
   await page.waitForTimeout(200);
   const afterUndo = await countDots();
   check("image import: Ctrl+Z returns dot count to pre-import", afterUndo === beforeImport, `${beforeImport} -> ${afterImport} -> ${afterUndo}`);
+
+  // Clearing the session flag (not localStorage/IndexedDB this time) and
+  // reloading simulates a genuinely new tab — pins the actual new gating
+  // behavior end to end, distinct from the "reload skips Home" check above.
+  await page.evaluate(() => { try { sessionStorage.clear(); } catch { /* ignore */ } });
+  await page.reload({ waitUntil: "networkidle" });
+  await page.waitForSelector("svg");
+  await page.waitForTimeout(600);
+  check("boot: clearing the session flag brings Home back on reload", await createNewBtn().first().isVisible());
 
   check("no uncaught page errors", pageErrors.length === 0, pageErrors.join("; "));
 

@@ -107,7 +107,12 @@ export function computeCanvasDims(physW: number, physH: number, cellPhysical: nu
 export interface GridSample { key: string; x: number; y: number; r: number; g: number; b: number; lum: number }
 
 // Sample an image on the snap-mode's lattice, one sample per grid point.
-export function sampleImageGrid(bitmap: ImageBitmap, w: number, h: number, snapMode: SnapMode): GridSample[] {
+// `glitch` (sample-grid cells, default 0 = off) reads each color channel from
+// a horizontally offset position — R shifted left, B shifted right, G
+// centered — a chromatic-aberration tear rather than a true single-pixel
+// read. `lum` is derived from the same (glitched) r/g/b, so threshold
+// filtering sees the corrupted read too — that's the point, not a bug.
+export function sampleImageGrid(bitmap: ImageBitmap, w: number, h: number, snapMode: SnapMode, glitch = 0): GridSample[] {
   const W = Math.round(w), H = Math.round(h);
   const out: GridSample[] = [];
   if (W <= 0 || H <= 0) return out;
@@ -135,11 +140,19 @@ export function sampleImageGrid(bitmap: ImageBitmap, w: number, h: number, snapM
   ctx.drawImage(bitmap, (sw - iw * scale) / 2, (sh - ih * scale) / 2, iw * scale, ih * scale);
   const data = ctx.getImageData(0, 0, sw, sh).data;
 
+  const clampX = (x: number) => Math.min(sw - 1, Math.max(0, x));
   for (const p of generateGridPoints(snapMode, W, H)) {
-    const sx = Math.min(sw - 1, Math.max(0, Math.round(p.x / step)));
+    const sx = clampX(Math.round(p.x / step));
     const sy = Math.min(sh - 1, Math.max(0, Math.round(p.y / step)));
     const i = (sy * sw + sx) * 4;
-    const r = data[i], g = data[i + 1], b = data[i + 2];
+    let r: number, g: number, b: number;
+    if (glitch > 0) {
+      r = data[(sy * sw + clampX(sx - glitch)) * 4];
+      g = data[i + 1];
+      b = data[(sy * sw + clampX(sx + glitch)) * 4 + 2];
+    } else {
+      r = data[i]; g = data[i + 1]; b = data[i + 2];
+    }
     const lum = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255;
     out.push({ key: p.key, x: p.x, y: p.y, r, g, b, lum });
   }

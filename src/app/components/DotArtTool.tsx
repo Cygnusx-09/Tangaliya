@@ -1,6 +1,7 @@
 import { useState, useRef, useCallback, useEffect, useMemo, memo } from "react";
+import { flushSync } from "react-dom";
 import { HexColorPicker } from "react-colorful";
-import { Eraser, Pen, Trash2, ZoomIn, ZoomOut, Maximize2, Undo2, Redo2, MousePointer2, FileImage, FileCode2, Printer, Grid3x3, Magnet, Ruler, Plus, Minus, Droplet, PaintBucket, Moon, Sun, Volume2, VolumeX, Hand, GripHorizontal, Menu, SlidersHorizontal, Dices, Save, FolderOpen, ImagePlus, Type, FlipHorizontal2, FlipVertical2, Slash, PenTool, Circle, Layers as LayersIcon, Eye, EyeOff, Copy, ChevronUp, ChevronDown, Repeat } from "lucide-react";
+import { Eraser, Pen, Trash2, ZoomIn, ZoomOut, Maximize2, Undo2, Redo2, MousePointer2, FileImage, FileCode2, Printer, Grid3x3, Magnet, Ruler, Plus, Minus, Droplet, PaintBucket, Moon, Sun, Volume2, VolumeX, GripHorizontal, Menu, SlidersHorizontal, Dices, Save, FolderOpen, ImagePlus, Type, FlipHorizontal2, FlipVertical2, Slash, PenTool, Circle, Layers as LayersIcon, Eye, EyeOff, Copy, ChevronUp, ChevronDown, Repeat, Home as HomeIcon, Combine, Check } from "lucide-react";
 import { sfx, setSfxMuted } from "../sounds";
 import { Progress } from "./ui/progress";
 import {
@@ -23,11 +24,16 @@ import {
   type ArrayMode, type Transform,
 } from "@/lib/array";
 import {
-  PROJECT_VERSION, AUTOSAVE_KEY, PROJECT_TAG, parseScene, sceneToLayers, flattenLayers,
+  PROJECT_VERSION, AUTOSAVE_KEY, PROJECT_TAG, parseScene, sceneToLayers, flattenLayers, genLayerId, defaultScene,
   convertUnit, roundForUnit, fmt, buildSVGString,
   type Unit, type Layer, type SceneFile,
 } from "@/lib/scene";
 import { useLayers } from "../hooks/useLayers";
+import {
+  genProjectId, getProject, putProject, getActiveProjectId, setActiveProjectId, listProjects, randomProjectName,
+} from "@/lib/projectLibrary";
+import { captureThumbnail } from "@/lib/thumbnail";
+import { HomeScreen } from "./HomeScreen";
 
 type Tool = "draw" | "erase" | "select" | "line" | "pen" | "shape" | "array";
 const MIN_ZOOM = 0.1;
@@ -355,13 +361,27 @@ function ValueSlider({
   );
 }
 
-export function DotArtTool() {
+interface DotArtToolProps {
+  showHome: boolean;
+  onShowHome: () => void;
+  onHideHome: () => void;
+}
+
+export function DotArtTool({ showHome, onShowHome, onHideHome }: DotArtToolProps) {
   // Restore the autosaved session once, before first paint, so the initial
   // fit-to-view uses the right canvas size (no flash, no double-fit).
   const bootRef = useRef<SceneFile | null | undefined>(undefined);
+  // Which library entry (if any) this session is mirroring — read alongside
+  // AUTOSAVE_KEY at the same lazy-init point. Ref only: nothing in the UI
+  // renders "which project is open" in v1, so there's no render-driven
+  // consumer that would need a state twin (see the mirroring pattern note
+  // elsewhere in this file — a ref twin exists for values a handler needs
+  // that ALSO drive rendering; this drives neither).
+  const activeProjectIdRef = useRef<string | null>(null);
   if (bootRef.current === undefined) {
     try { bootRef.current = parseScene(localStorage.getItem(AUTOSAVE_KEY) ?? ""); }
     catch { bootRef.current = null; }
+    activeProjectIdRef.current = getActiveProjectId();
   }
   const boot = bootRef.current;
 
@@ -381,9 +401,16 @@ export function DotArtTool() {
     activeLayer, dots, setDots, dotsRef,
     undoCount, redoCount, pushUndo, undo, redo,
     selectLayer, addLayer, duplicateLayer, deleteLayer,
-    moveLayer, toggleLayerVisible, renameLayer,
+    moveLayer, toggleLayerVisible, renameLayer, mergeLayers,
   } = useLayers(boot, clearSelection);
   const [showLayers, setShowLayers] = useState(false);
+  // Merge-candidate picks in the Layers panel — separate from `activeLayerId`
+  // (which layer you're drawing on). Ctrl/Cmd/Shift-click toggles membership;
+  // a plain click still activates as before and leaves this untouched.
+  const [mergeSelectIds, setMergeSelectIds] = useState<Set<string>>(new Set());
+  // Filtered against live `layers` so a stale id (its layer got deleted, or a
+  // merge just consumed it) never inflates the panel's "N selected" count.
+  const mergeSelectCount = layers.filter((l) => mergeSelectIds.has(l.id)).length;
   // Canvas layer-nav arrows (up = layer above, down = layer below). pulseKey
   // bumps on every arrow switch so the newly-active DotLayer replays its
   // one-shot pulse; layerToast shows the landed-on layer's name briefly.
@@ -394,6 +421,10 @@ export function DotArtTool() {
   const [color, setColor] = useState(boot?.color ?? "#FF2A2A");
   const [recentColors, setRecentColors] = useState<string[]>(boot?.recentColors ?? []);
   const [paletteOpen, setPaletteOpen] = useState(false); // Recent/Palette collapsible dropdown
+  const [canvasSetupOpen, setCanvasSetupOpen] = useState(true); // Units/Canvas Size/Cell Size collapsible
+  // Bumped by the boot-flush effect below to tell HomeScreen to re-list projects
+  // after it refreshes the active tile's thumbnail/timestamp on a cold boot.
+  const [homeRefresh, setHomeRefresh] = useState(0);
   const [radius, setRadius] = useState(boot?.radius ?? 1);
   // Dot render shape — global (all dots), snapping unaffected. Persisted.
   const [dotShape, setDotShape] = useState<DotShape>(() => {
@@ -407,7 +438,7 @@ export function DotArtTool() {
   // shape commit, hand-draw), independent of snap mode and of the Line/Pen
   // Spacing model's own density curve. 1 = no-op (already the finest lattice
   // step); only thins placement once it exceeds the active mode's own spacing.
-  const [minSpacing, setMinSpacing] = useState(boot?.minSpacing ?? 1);
+  const [minSpacing, setMinSpacing] = useState(boot?.minSpacing ?? 3);
   // Stroke snap reach, % of a lattice step: how far away a point "catches"
   // the pen during a stroke. High = eager/loose, low = deliberate placement.
   const [snapReach, setSnapReach] = useState(boot?.snapReach ?? 35);
@@ -425,15 +456,25 @@ export function DotArtTool() {
   useEffect(() => { importOpenRef.current = importOpen; }, [importOpen]);
   const [importImg, setImportImg] = useState<ImageBitmap | null>(null);
   const [traceStyle, setTraceStyle] = useState<"color" | "mono" | "tonal">("color");
-  const [traceThreshold, setTraceThreshold] = useState(0.5);
-  const [traceDotSize, setTraceDotSize] = useState(8);          // world-px dot radius
-  const [traceDetail, setTraceDetail] = useState<SnapMode>("both"); // sub-cell fill
+  const [traceThreshold, setTraceThreshold] = useState(1);
+  const [traceDotSize, setTraceDotSize] = useState(1.5);          // world-px dot radius
+  const [traceDetail, setTraceDetail] = useState<SnapMode>("fine"); // sub-cell fill
   const [importCell, setImportCell] = useState(10);             // cell size for the import (current unit)
   const [traceTonalColor, setTraceTonalColor] = useState(false); // Light & Shadow: keep image colors
   // Image-modal-only style (Colors palette vs Light & Shadow tonal halftone) —
   // separate from traceStyle, which the Text modal still uses (color/mono/tonal).
   const [imgStyle, setImgStyle] = useState<"palette" | "tonal">("palette");
   const [traceColorCount, setTraceColorCount] = useState(8);     // Colors slider, 1..32
+  // Glitch: RGB channel offset (chromatic-aberration tear) applied during
+  // sampling, Colors-mode only. Amount is in sample-grid cells — see
+  // sampleImageGrid's `glitch` param for the actual R/G/B shift.
+  const [traceGlitch, setTraceGlitch] = useState(false);
+  const [traceGlitchAmount, setTraceGlitchAmount] = useState(4);
+  // "Add to canvas" adds one new layer per palette color, appended above the
+  // existing stack, instead of replacing the active layer's content. Off by
+  // default — layer add/delete isn't undoable (only dot edits within a layer
+  // are), so this stays opt-in.
+  const [splitLayersByColor, setSplitLayersByColor] = useState(false);
   // Manual swatch recolors, keyed by the ORIGINAL quantized hex (not slot
   // index) so an edit survives a slider/threshold recompute as long as that
   // hex reappears in the new quantization. Cleared only on modal open / new image.
@@ -484,13 +525,47 @@ export function DotArtTool() {
   useEffect(() => {
     try { localStorage.setItem("tangaliya-theme", dark ? "dark" : "light"); } catch { /* ignore */ }
   }, [dark]);
-  const toggleTheme = useCallback(() => {
+  // Plain crossfade fallback (reduced-motion or a browser without View
+  // Transitions) — the `.theming` class drives theme.css's blanket
+  // background/color/border transition.
+  const crossfadeTheme = useCallback(() => {
     setTheming(true);
     window.clearTimeout(themeTimerRef.current);
     themeTimerRef.current = window.setTimeout(() => setTheming(false), 350);
     setDark((d) => !d);
-    sfx.toggle();
   }, []);
+  // Diagonal wipe reveal via the native View Transitions API — the new theme
+  // sweeps down over the old one on a slant (leading from the top-left,
+  // trailing at the top-right), instead of the whole UI dissolving
+  // uniformly. `flushSync` forces the setDark commit to apply synchronously
+  // inside the transition callback, since startViewTransition snapshots the
+  // DOM right after that callback returns and React's setState is normally
+  // batched/async. theme.css disables the API's own default crossfade on the
+  // root pseudo-elements so only this manual clip-path wipe animates.
+  // The polygon's top edge stays pinned at (0%,0%)-(100%,0%) in both
+  // keyframes; only the bottom (leading) edge travels, from a degenerate
+  // sliver above the viewport to well past its bottom, so the two vertex
+  // pairs interpolate smoothly with no shape "pop".
+  const toggleTheme = useCallback(() => {
+    sfx.toggle();
+    const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    if (reduceMotion || !document.startViewTransition) { crossfadeTheme(); return; }
+
+    const transition = document.startViewTransition(() => {
+      flushSync(() => setDark((d) => !d));
+    });
+    transition.ready.then(() => {
+      document.documentElement.animate(
+        {
+          clipPath: [
+            "polygon(0% 0%, 100% 0%, 100% -65%, 0% -15%)",
+            "polygon(0% 0%, 100% 0%, 100% 115%, 0% 165%)",
+          ],
+        },
+        { duration: 1400, easing: "cubic-bezier(0.65, 0, 0.35, 1)", pseudoElement: "::view-transition-new(root)" },
+      );
+    });
+  }, [crossfadeTheme]);
 
   const [muted, setMuted] = useState<boolean>(() => {
     try { return localStorage.getItem("tangaliya-muted") === "1"; } catch { return false; }
@@ -499,6 +574,15 @@ export function DotArtTool() {
     setSfxMuted(muted);
     try { localStorage.setItem("tangaliya-muted", muted ? "1" : "0"); } catch { /* ignore */ }
   }, [muted]);
+
+  // Export format for the single Export button + dropdown. Persisted.
+  const [exportFormat, setExportFormat] = useState<"svg" | "png" | "pdf">(() => {
+    try { const f = localStorage.getItem("tangaliya-export-format"); return (f === "png" || f === "pdf") ? f : "svg"; } catch { return "svg"; }
+  });
+  useEffect(() => {
+    try { localStorage.setItem("tangaliya-export-format", exportFormat); } catch { /* ignore */ }
+  }, [exportFormat]);
+  const [exportMenuOpen, setExportMenuOpen] = useState(false);
 
   // ── Responsive: below ~1100px (iPad portrait, split landscape, phones) the
   // two side panels collapse into slide-in overlays toggled by floating buttons. ──
@@ -821,6 +905,7 @@ export function DotArtTool() {
 
   useEffect(() => {
     const down = (e: KeyboardEvent) => {
+      if (showHome) return;
       if (e.code === "Space" && !e.repeat) { e.preventDefault(); spaceDownRef.current = true; }
     };
     const up = (e: KeyboardEvent) => {
@@ -829,10 +914,11 @@ export function DotArtTool() {
     window.addEventListener("keydown", down);
     window.addEventListener("keyup", up);
     return () => { window.removeEventListener("keydown", down); window.removeEventListener("keyup", up); };
-  }, []);
+  }, [showHome]);
 
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
+      if (showHome) return; // Home is covering the canvas — its own Escape/typing handlers own input now
       const target = e.target as HTMLElement;
       const typing = !!target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable);
       const mod = e.ctrlKey || e.metaKey;
@@ -909,7 +995,7 @@ export function DotArtTool() {
     // might swallow Ctrl+Z (e.g. an embedding preview's own undo).
     window.addEventListener("keydown", handler, true);
     return () => window.removeEventListener("keydown", handler, true);
-  }, [undo, redo, selectAll, copySelected, pasteClipboard, duplicateSelected, deleteSelected, nudgeSelected]);
+  }, [undo, redo, selectAll, copySelected, pasteClipboard, duplicateSelected, deleteSelected, nudgeSelected, showHome]);
 
   useEffect(() => {
     const svg = svgRef.current;
@@ -2519,6 +2605,14 @@ export function DotArtTool() {
 
   // Replace the entire document with a loaded scene (undoable, re-fits the view).
   const applyScene = useCallback((scene: SceneFile) => {
+    // Written synchronously (not left to the debounced autosave effect below)
+    // so AUTOSAVE_KEY and activeProjectIdRef can never point at mismatched
+    // documents — e.g. Create New mints a new id and this scene in the same
+    // tick; without this, a crash inside the ~400ms autosave debounce window
+    // would leave AUTOSAVE_KEY holding the PREVIOUS project's dots under the
+    // NEW project's id, and the next library flush would silently overwrite
+    // the new project's IndexedDB record with stale content.
+    try { localStorage.setItem(AUTOSAVE_KEY, JSON.stringify(scene)); } catch { /* quota / private mode */ }
     pushUndo();
     const nextLayers = sceneToLayers(scene);
     const activeId = nextLayers[nextLayers.length - 1].id;
@@ -2580,18 +2674,136 @@ export function DotArtTool() {
     sfx.export();
     const blob = new Blob([JSON.stringify(buildScene(), null, 2)], { type: "application/json" });
     downloadBlob(blob, "tangaliya-project.json");
+    void flushActiveProjectToLibrary();
   }, [buildScene]);
 
-  const openProjectFile = useCallback((file: File) => {
+  const openProjectFile = useCallback((file: File, afterApply?: (scene: SceneFile | null) => void) => {
     const reader = new FileReader();
     reader.onload = () => {
       const scene = parseScene(String(reader.result));
-      if (!scene) { alert("That doesn't look like a Tangaliya project file."); return; }
+      if (!scene) { alert("That doesn't look like a Tangaliya project file."); afterApply?.(null); return; }
       sfx.ui();
       applyScene(scene);
+      afterApply?.(scene);
     };
     reader.readAsText(file);
   }, [applyScene]);
+
+  // ── Project library (Home screen) ──
+  // Coarser, event-driven persistence layered on top of the always-current
+  // AUTOSAVE_KEY mirror above: a project only gets an IndexedDB record (with
+  // a rasterized thumbnail) when the user actually leaves the editor for
+  // Home, saves explicitly, or mints a new/loaded document — never on every
+  // debounced autosave tick, since thumbnail capture is an async SVG->canvas
+  // rasterize that would be wasteful (and racy) to run on every keystroke.
+  const commitToLibrary = useCallback(async (scene: SceneFile, id: string) => {
+    const pxW = scene.canvasPhysW * (CELL_SIZE / scene.cellPhysical);
+    const pxH = scene.canvasPhysH * (CELL_SIZE / scene.cellPhysical);
+    const svg = buildSVGString(flattenLayers(sceneToLayers(scene)), pxW, pxH, CELL_SIZE / scene.cellPhysical,
+      scene.unit, scene.canvasBg, scene.gridColor, scene.gridOpacity, scene.gridThickness, CELL_SIZE, dotShape);
+    let thumbnail = "";
+    try { thumbnail = await captureThumbnail(svg, pxW, pxH); } catch { /* non-fatal — tile just shows a blank swatch */ }
+    const existing = await getProject(id);
+    await putProject({ id, name: existing?.name ?? randomProjectName(), thumbnail, lastModified: Date.now(), scene });
+  }, [dotShape]);
+
+  const flushActiveProjectToLibrary = useCallback(async () => {
+    const scene = buildScene();
+    const isBlank = (scene.layers ?? []).every((l) => l.dots.length === 0);
+    if (isBlank && activeProjectIdRef.current === null) return; // never-touched document — nothing worth a tile
+    let id = activeProjectIdRef.current;
+    if (id === null) {
+      id = genProjectId();
+      activeProjectIdRef.current = id;
+      setActiveProjectId(id);
+    }
+    await commitToLibrary(scene, id);
+  }, [buildScene, commitToLibrary]);
+
+  const createNewProject = useCallback(async () => {
+    const scene = defaultScene();
+    applyScene(scene);
+    const id = genProjectId();
+    activeProjectIdRef.current = id;
+    setActiveProjectId(id);
+    // No thumbnail yet — it'd just rasterize an empty canvas; the next real
+    // flush (leaving for Home, saving) captures the first meaningful preview.
+    await putProject({ id, name: randomProjectName(), thumbnail: "", lastModified: Date.now(), scene });
+  }, [applyScene]);
+
+  const openLibraryProject = useCallback(async (id: string) => {
+    // The live document IS this project already (Home can now show on boot,
+    // before the flushing click that used to guarantee freshness) — the
+    // library record may be staler than what's already on screen (nothing
+    // flushed since the last coarse trigger). Re-applying it would clobber
+    // fresher work, so treat opening your own active tile as "resume", not
+    // "reload from disk".
+    if (id === activeProjectIdRef.current) return true;
+    const record = await getProject(id);
+    if (!record) return false; // vanished (e.g. deleted from another tab) — Home's own list will drop it too
+    applyScene(record.scene);
+    activeProjectIdRef.current = id;
+    setActiveProjectId(id);
+    return true;
+  }, [applyScene]);
+
+  const openProjectFileAndRegister = useCallback((file: File) => {
+    return new Promise<boolean>((resolve) => {
+      openProjectFile(file, (scene) => {
+        if (!scene) { resolve(false); return; }
+        const id = genProjectId();
+        activeProjectIdRef.current = id;
+        setActiveProjectId(id);
+        void commitToLibrary(scene, id).then(() => resolve(true));
+      });
+    });
+  }, [openProjectFile, commitToLibrary]);
+
+  // If the tile for the project currently mirrored by this session gets
+  // deleted from Home, drop the pointer rather than let the next flush
+  // resurrect it under the same id — a fresh id is minted next time instead.
+  const notifyProjectDeleted = useCallback((id: string) => {
+    if (activeProjectIdRef.current === id) { activeProjectIdRef.current = null; setActiveProjectId(null); }
+  }, []);
+
+  // One-time migration: an existing single-autosave user has no library yet.
+  // Runs off the microtask queue (needs an async IndexedDB read) rather than
+  // the synchronous bootRef block, guarded so it can never double-fire (incl.
+  // React 18 StrictMode's dev-only double-invoke, since refs survive that).
+  useEffect(() => {
+    if (activeProjectIdRef.current !== null) return;
+    if (!boot) return;
+    (async () => {
+      if ((await listProjects()).length > 0) return;
+      if (activeProjectIdRef.current !== null) return; // re-check after the await
+      const id = genProjectId();
+      await commitToLibrary(boot, id);
+      activeProjectIdRef.current = id;
+      setActiveProjectId(id);
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Boot flush: if the app booted straight onto Home (cold open — see
+  // App.tsx's sessionStorage gate) and there's already an active library
+  // project, refresh that tile's thumbnail/timestamp once. Without this the
+  // tile would show whatever the last coarse flush (a Home visit, Save, or
+  // new/loaded doc) captured — possibly last session's work, not the most
+  // recent — since Home no longer gates through a flushing click to get
+  // here. Disjoint from the migration effect above (that one only runs when
+  // there's NO active project yet). Purely cosmetic and fine to be async —
+  // unlike openLibraryProject's active-tile guard above, nothing races this.
+  const bootFlushedRef = useRef(false);
+  useEffect(() => {
+    if (bootFlushedRef.current) return;
+    bootFlushedRef.current = true;
+    if (!showHome) return; // same-session reload, not a cold boot — nothing to refresh yet
+    if (!boot) return;
+    const id = activeProjectIdRef.current;
+    if (id === null) return;
+    void commitToLibrary(boot, id).then(() => setHomeRefresh((k) => k + 1));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // ── Image import (modal) ──
   // The "Import Image" modal tunes a conversion against a loaded image and shows
@@ -2640,8 +2852,9 @@ export function DotArtTool() {
   const basePalette = useMemo(() => {
     if (!importImg || imgStyle !== "palette") return null;
     return buildPaletteDots(importImg, importDims.pxW, importDims.pxH,
-      { colorCount: traceColorCount, threshold: traceThreshold, dotRadius: traceDotSize, snapMode: traceDetail });
-  }, [importImg, importDims, imgStyle, traceColorCount, traceThreshold, traceDotSize, traceDetail]);
+      { colorCount: traceColorCount, threshold: traceThreshold, dotRadius: traceDotSize, snapMode: traceDetail,
+        glitch: traceGlitch ? traceGlitchAmount : 0 });
+  }, [importImg, importDims, imgStyle, traceColorCount, traceThreshold, traceDotSize, traceDetail, traceGlitch, traceGlitchAmount]);
 
   // Palette with manual swatch edits applied — a pure lookup, never re-quantizes.
   const effectivePalette = useMemo(() =>
@@ -2706,9 +2919,10 @@ export function DotArtTool() {
   // Close the modal and drop the loaded image so each open starts fresh.
   const closeImport = useCallback(() => { setImportOpen(false); setImportImg(null); }, []);
 
-  // Shared commit: resize the canvas to the source aspect + cell size, fit the
-  // view, and replace the dots (undoable). Used by the image and text modals.
-  const commitDots = useCallback((map: Map<string, Dot>, dims: { pxW: number; pxH: number; physW: number; physH: number }, cell: number) => {
+  // Resize the canvas to the source aspect + cell size and fit the view — the
+  // document-wide part of a commit, shared by the normal (replace) and
+  // split-into-layers commit paths below.
+  const resizeCanvasTo = useCallback((dims: { pxW: number; pxH: number; physW: number; physH: number }, cell: number) => {
     const { pxW, pxH, physW, physH } = dims;
     setCellPhysical(cell); setCellInput(String(cell));
     setCanvasPhysW(physW); setWInput(String(physW));
@@ -2722,19 +2936,62 @@ export function DotArtTool() {
       rotRef.current = 0; setRot(0);
       applyViewport(z, { x: (vp.width - pxW * z) / 2, y: (vp.height - pxH * z) / 2 });
     }
+  }, [applyViewport]);
 
+  // Shared commit: resize the canvas, then replace the active layer's dots
+  // (undoable). Used by the image and text modals.
+  const commitDots = useCallback((map: Map<string, Dot>, dims: { pxW: number; pxH: number; physW: number; physH: number }, cell: number) => {
+    resizeCanvasTo(dims, cell);
     pushUndo();
     const next = new Map(map);
     setDots(next); dotsRef.current = next;
     setSelectedKeys(new Set()); selectedKeysRef.current = new Set();
     sfx.ui();
-  }, [pushUndo, applyViewport]);
+  }, [pushUndo, resizeCanvasTo]);
+
+  // Alternative commit for the image modal's "Split into layers by color":
+  // groups previewDots by their final (post-edit) color and appends one new
+  // layer per color to the TOP of the stack. Existing layers' content is
+  // never touched — this is a structural add, not a replace, so (matching
+  // every other add/delete/duplicate-layer op) it's immediate and NOT on the
+  // undo stack. Canvas still resizes to the import dims, same as a normal
+  // import, since that's a document-wide setting rather than a layer one.
+  const addImportAsColorLayers = useCallback(() => {
+    if (!importDims || !previewDots || !effectivePalette) return;
+    resizeCanvasTo(importDims, importCell);
+
+    const byColor = new Map<string, Map<string, Dot>>();
+    for (const [key, dot] of previewDots) {
+      let m = byColor.get(dot.color);
+      if (!m) { m = new Map(); byColor.set(dot.color, m); }
+      m.set(key, dot);
+    }
+    // Layer order/naming follows the palette's own population order
+    // (most-used first), deduped — matches the swatch strip above it.
+    const seen = new Set<string>();
+    const orderedColors: string[] = [];
+    for (const c of effectivePalette) {
+      if (!seen.has(c) && byColor.has(c)) { seen.add(c); orderedColors.push(c); }
+    }
+    const newLayers: Layer[] = orderedColors.map((color) => ({
+      id: genLayerId(), name: color, visible: true, dots: byColor.get(color)!,
+    }));
+    if (newLayers.length === 0) return;
+
+    const next = [...layersRef.current, ...newLayers];
+    setLayers(next); layersRef.current = next;
+    const topId = newLayers[newLayers.length - 1].id;
+    setActiveLayerId(topId); activeLayerIdRef.current = topId;
+    clearSelection();
+    sfx.toggle();
+  }, [importDims, previewDots, effectivePalette, importCell, resizeCanvasTo, layersRef, setLayers, activeLayerIdRef, setActiveLayerId, clearSelection]);
 
   const addImportToCanvas = useCallback(() => {
     if (!importDims || !previewDots) return;
-    commitDots(previewDots, importDims, importCell);
+    if (splitLayersByColor && imgStyle === "palette") addImportAsColorLayers();
+    else commitDots(previewDots, importDims, importCell);
     setImportOpen(false); setImportImg(null);
-  }, [importDims, previewDots, importCell, commitDots]);
+  }, [importDims, previewDots, importCell, commitDots, splitLayersByColor, imgStyle, addImportAsColorLayers]);
 
   // Render the preview dots into the modal's canvas — sized to fill whatever
   // room the preview box actually has (ResizeObserver-driven, dpr-scaled for
@@ -3039,29 +3296,28 @@ export function DotArtTool() {
       {/* ── Left panel — tools & controls ── */}
       <aside className={`${compact ? `fixed left-0 top-0 z-50 bg-[var(--app-bg)] shadow-2xl transition-transform duration-300 ${leftOpen ? "translate-x-0" : "-translate-x-full"}` : "relative"} w-[300px] max-w-[88vw] shrink-0 h-dvh p-4 flex flex-col gap-4 overflow-hidden`}>
 
-        {/* Brand header */}
-        <div className="bg-[var(--card)] rounded-3xl px-5 py-3.5 flex items-center gap-3 shrink-0">
-          <svg width="34" height="34" viewBox="0 0 39 39" className="shrink-0" aria-label="morii logo">
-            {[
-              [18.5, 3.5],  // top
-              [3.5, 18.5],  // left
-              [18.5, 18.5], // center
-              [34.5, 18.5], // right
-              [18.5, 34.5], // bottom
-            ].map(([cx, cy]) => (
-              <circle key={`${cx}-${cy}`} cx={cx} cy={cy} r={3.5} fill="#FF2A2A" />
-            ))}
-          </svg>
-          <span className="text-[26px] font-bold tracking-[-0.8px] text-[var(--brand)] leading-none">Tangaliya</span>
-          <div className="ml-auto flex items-center gap-1.5 shrink-0">
+        {/* Header controls — the brand mark now lives on the Home screen only
+            (the front door), freeing this row up in the working editor. */}
+        <div className="bg-[var(--card)] rounded-3xl px-5 py-3.5 shrink-0">
+          <div className="flex items-center gap-1.5 shrink-0">
+            <button onClick={async () => { await flushActiveProjectToLibrary(); onShowHome(); }} title="Home"
+              aria-label="Go to Home"
+              className="flex-1 h-9 rounded-xl flex items-center justify-center bg-[var(--ctl)] text-[var(--txt-1)] hover:bg-[var(--ctl-hover)] transition-all">
+              <HomeIcon size={17} />
+            </button>
+            <button onClick={() => fileInputRef.current?.click()} title="Open a saved project file"
+              aria-label="Open a saved project file"
+              className="flex-1 h-9 rounded-xl flex items-center justify-center bg-[var(--ctl)] text-[var(--txt-1)] hover:bg-[var(--ctl-hover)] transition-all">
+              <FolderOpen size={17} />
+            </button>
             <button onClick={() => setMuted((m) => !m)} title={muted ? "Unmute sounds" : "Mute sounds"}
               aria-label="Toggle interface sounds"
-              className="w-9 h-9 rounded-xl flex items-center justify-center bg-[var(--ctl)] text-[var(--txt-1)] hover:bg-[var(--ctl-hover)] transition-all">
+              className="flex-1 h-9 rounded-xl flex items-center justify-center bg-[var(--ctl)] text-[var(--txt-1)] hover:bg-[var(--ctl-hover)] transition-all">
               {muted ? <VolumeX size={17} /> : <Volume2 size={17} />}
             </button>
             <button onClick={toggleTheme} title={dark ? "Switch to light mode" : "Switch to dark mode"}
               aria-label="Toggle dark mode"
-              className="w-9 h-9 rounded-xl flex items-center justify-center bg-[var(--ctl)] text-[var(--txt-1)] hover:bg-[var(--ctl-hover)] transition-all">
+              className="flex-1 h-9 rounded-xl flex items-center justify-center bg-[var(--ctl)] text-[var(--txt-1)] hover:bg-[var(--ctl-hover)] transition-all">
               {dark ? <Sun size={17} /> : <Moon size={17} />}
             </button>
           </div>
@@ -3070,112 +3326,88 @@ export function DotArtTool() {
         {/* Controls card */}
         <div className="bg-[var(--card)] rounded-3xl p-4 flex-1 overflow-y-auto flex flex-col gap-5 [&>*]:shrink-0" style={{ scrollbarWidth: "none" }}>
 
-          {/* Tools */}
+          {/* Import: Image / Text → dots, each opens a modal to tune, preview, then commit */}
           <div>
-            <div className="grid grid-cols-7 gap-2">
-              {([
-                { t: "select" as Tool, icon: <MousePointer2 size={20} />, label: "Select (V)" },
-                { t: "draw" as Tool, icon: <Pen size={20} />, label: "Draw (B)" },
-                { t: "erase" as Tool, icon: <Eraser size={20} />, label: "Erase (E)" },
-                { t: "line" as Tool, icon: <Slash size={20} />, label: "Line (L)" },
-                { t: "pen" as Tool, icon: <PenTool size={20} />, label: "Pen (P)" },
-                { t: "shape" as Tool, icon: <Circle size={20} />, label: "Shape (S)" },
-                { t: "array" as Tool, icon: <Repeat size={20} />, label: "Array (A)" },
-              ]).map(({ t, icon, label }) => (
-                <button key={t} title={label}
-                  onClick={() => {
-                    // Switching away from Pen mid-path discards the pending
-                    // anchors — you can't leave a dangling path around.
-                    if (tool === "pen" && t !== "pen" && penAnchorsRef.current.length > 0) cancelPenPath();
-                    // Same for Array's Curve mode.
-                    if (tool === "array" && t !== "array" && arrayCurveAnchorsRef.current.length > 0) cancelArrayCurve();
-                    setTool(t);
-                    if (t === "select") sfx.toolSelect(); else if (t === "draw" || t === "line" || t === "pen" || t === "shape" || t === "array") sfx.toolDraw(); else sfx.toolErase();
-                    if (t === "draw" || t === "line" || t === "pen" || t === "shape") setInspect("dot");
-                    // Array reuses the current selection as its motif, so it
-                    // joins Select as the tools that don't clear it on switch.
-                    if (t !== "select" && t !== "array") { setSelectedKeys(new Set()); selectedKeysRef.current = new Set(); }
-                  }}
-                  className={`aspect-square rounded-xl flex items-center justify-center transition-all ${tool === t ? "bg-[var(--solid)] text-[var(--solid-fg)]" : "bg-[var(--ctl)] text-[var(--txt-1)] hover:bg-[var(--ctl-hover)]"
-                    }`}>
-                  {icon}
-                </button>
-              ))}
+            <div className="text-[14px] text-[var(--txt-2)] tracking-[-0.3px] mb-2">Import</div>
+            <div className="flex gap-2">
+              <button onClick={openImportModal} title="Convert an image into editable dots"
+                className="flex-1 flex items-center justify-center gap-1.5 py-2.5 rounded-xl bg-[var(--ctl)] text-[var(--txt-1)] text-[13px] hover:bg-[var(--ctl-hover)] transition-colors">
+                <ImagePlus size={13} /> Image
+              </button>
+              <button onClick={() => { setImportCell(cellPhysical); setTextOpen(true); }} title="Convert typed text in any font into dissolving dots"
+                className="flex-1 flex items-center justify-center gap-1.5 py-2.5 rounded-xl bg-[var(--ctl)] text-[var(--txt-1)] text-[13px] hover:bg-[var(--ctl-hover)] transition-colors">
+                <Type size={13} /> Text
+              </button>
             </div>
           </div>
 
-          {/* Units */}
-          <div>
-            <div className="text-[14px] text-[var(--txt-2)] tracking-[-0.3px] mb-2">Units</div>
-            <div className="flex gap-2">
-              {(["mm", "cm", "in"] as Unit[]).map((u) => (
-                <button key={u} onClick={() => changeUnit(u)}
-                  className={`flex-1 py-2 rounded-xl text-[16px] transition-all ${unit === u ? "bg-[var(--solid)] text-[var(--solid-fg)]" : "bg-[var(--ctl)] text-[var(--txt-1)] hover:bg-[var(--ctl-hover)]"
-                    }`}>
-                  {u}
-                </button>
-              ))}
-            </div>
-          </div>
-
-          {/* Canvas Size */}
-          <div>
-            <div className="text-[14px] text-[var(--txt-2)] tracking-[-0.3px] mb-2">Canvas Size</div>
-            <div className="flex gap-2">
-              {([
-                { label: "W", value: wInput, onChange: setWInput, onCommit: commitW },
-                { label: "H", value: hInput, onChange: setHInput, onCommit: commitH },
-              ]).map(({ label, value, onChange, onCommit }) => (
-                <div key={label} className="flex-1 flex items-center gap-1.5 bg-[var(--ctl)] rounded-xl px-3 py-2">
-                  <span className="text-[16px] text-[var(--txt-2)] shrink-0">{label}</span>
-                  <input type="number" min="1" step="any" value={value}
-                    onChange={(e) => onChange(e.target.value)} onBlur={onCommit}
-                    onFocus={(e) => e.target.select()}
-                    onKeyDown={(e) => { if (e.key === "Enter") { onCommit(); (e.target as HTMLInputElement).blur(); } }}
-                    className="w-full min-w-0 bg-transparent text-[16px] text-[var(--txt-1)] text-right focus:outline-none [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none" />
+          {/* Canvas Setup: Units / Canvas Size / Cell Size, collapsible to save space */}
+          <div className="bg-[var(--ctl)] rounded-xl overflow-hidden">
+            <button onClick={() => setCanvasSetupOpen((o) => !o)}
+              className="w-full flex items-center justify-between p-3 text-[14px] text-[var(--txt-2)] tracking-[-0.3px]">
+              Canvas Setup
+              {canvasSetupOpen ? <ChevronUp size={16} /> : <ChevronDown size={16} />}
+            </button>
+            {canvasSetupOpen && (
+              <div className="p-3 pt-0 flex flex-col gap-4">
+                {/* Units */}
+                <div>
+                  <div className="text-[13px] text-[var(--txt-3)] mb-2">Units</div>
+                  <div className="flex gap-2">
+                    {(["mm", "cm", "in"] as Unit[]).map((u) => (
+                      <button key={u} onClick={() => changeUnit(u)}
+                        className={`flex-1 py-2 rounded-xl text-[16px] transition-all ${unit === u ? "bg-[var(--solid)] text-[var(--solid-fg)]" : "bg-[var(--card)] text-[var(--txt-1)] hover:bg-[var(--ctl-hover)]"
+                          }`}>
+                        {u}
+                      </button>
+                    ))}
+                  </div>
                 </div>
-              ))}
-            </div>
-            <div className="flex gap-2 mt-2">
-              {[
-                { mm_w: 100, mm_h: 100, label: "100²" },
-                { mm_w: 200, mm_h: 150, label: "4:3" },
-                { mm_w: 297, mm_h: 210, label: "A4" },
-              ].map((p) => {
-                const w = roundForUnit(convertUnit(p.mm_w, "mm", unit), unit);
-                const h = roundForUnit(convertUnit(p.mm_h, "mm", unit), unit);
-                return (
-                  <button key={p.label}
-                    onClick={() => { setCanvasPhysW(w); setCanvasPhysH(h); setWInput(String(w)); setHInput(String(h)); }}
-                    className="flex-1 py-1.5 rounded-lg text-[12px] text-[var(--txt-2)] bg-[var(--ctl)] hover:bg-[var(--ctl-hover)] transition-all">
-                    {p.label}
-                  </button>
-                );
-              })}
-            </div>
-          </div>
 
-          {/* Cell Size */}
-          <div>
-            <div className="text-[14px] text-[var(--txt-2)] tracking-[-0.3px] mb-2">Cell Size</div>
-            <div className="flex items-center gap-2">
-              <button onClick={() => stepCell(-1)} title="Smaller cell"
-                className="w-10 h-10 rounded-lg bg-[var(--ctl)] text-[var(--txt-1)] flex items-center justify-center hover:bg-[var(--ctl-hover)] transition-all shrink-0">
-                <Minus size={18} />
-              </button>
-              <div className="flex-1 flex items-center justify-center gap-1.5 bg-[var(--ctl)] rounded-xl py-2">
-                <input type="number" min="0.01" step="any" value={cellInput}
-                  onChange={(e) => setCellInput(e.target.value)} onBlur={commitCell}
-                  onFocus={(e) => e.target.select()}
-                  onKeyDown={(e) => { if (e.key === "Enter") { commitCell(); (e.target as HTMLInputElement).blur(); } }}
-                  className="w-12 bg-transparent text-[16px] text-[var(--txt-1)] text-center focus:outline-none [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none" />
-                <span className="text-[13px] text-[var(--txt-2)]">{unit}</span>
+                {/* Canvas Size */}
+                <div>
+                  <div className="text-[13px] text-[var(--txt-3)] mb-2">Canvas Size</div>
+                  <div className="flex gap-2">
+                    {([
+                      { label: "W", value: wInput, onChange: setWInput, onCommit: commitW },
+                      { label: "H", value: hInput, onChange: setHInput, onCommit: commitH },
+                    ]).map(({ label, value, onChange, onCommit }) => (
+                      <div key={label} className="flex-1 flex items-center gap-1.5 bg-[var(--card)] rounded-xl px-3 py-2">
+                        <span className="text-[16px] text-[var(--txt-2)] shrink-0">{label}</span>
+                        <input type="number" min="1" step="any" value={value}
+                          onChange={(e) => onChange(e.target.value)} onBlur={onCommit}
+                          onFocus={(e) => e.target.select()}
+                          onKeyDown={(e) => { if (e.key === "Enter") { onCommit(); (e.target as HTMLInputElement).blur(); } }}
+                          className="w-full min-w-0 bg-transparent text-[16px] text-[var(--txt-1)] text-right focus:outline-none [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none" />
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Cell Size */}
+                <div>
+                  <div className="text-[13px] text-[var(--txt-3)] mb-2">Cell Size</div>
+                  <div className="flex items-center gap-2">
+                    <button onClick={() => stepCell(-1)} title="Smaller cell"
+                      className="w-10 h-10 rounded-lg bg-[var(--card)] text-[var(--txt-1)] flex items-center justify-center hover:bg-[var(--ctl-hover)] transition-all shrink-0">
+                      <Minus size={18} />
+                    </button>
+                    <div className="flex-1 flex items-center justify-center gap-1.5 bg-[var(--card)] rounded-xl py-2">
+                      <input type="number" min="0.01" step="any" value={cellInput}
+                        onChange={(e) => setCellInput(e.target.value)} onBlur={commitCell}
+                        onFocus={(e) => e.target.select()}
+                        onKeyDown={(e) => { if (e.key === "Enter") { commitCell(); (e.target as HTMLInputElement).blur(); } }}
+                        className="w-12 bg-transparent text-[16px] text-[var(--txt-1)] text-center focus:outline-none [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none" />
+                      <span className="text-[13px] text-[var(--txt-2)]">{unit}</span>
+                    </div>
+                    <button onClick={() => stepCell(1)} title="Larger cell"
+                      className="w-10 h-10 rounded-lg bg-[var(--card)] text-[var(--txt-1)] flex items-center justify-center hover:bg-[var(--ctl-hover)] transition-all shrink-0">
+                      <Plus size={18} />
+                    </button>
+                  </div>
+                </div>
               </div>
-              <button onClick={() => stepCell(1)} title="Larger cell"
-                className="w-10 h-10 rounded-lg bg-[var(--ctl)] text-[var(--txt-1)] flex items-center justify-center hover:bg-[var(--ctl-hover)] transition-all shrink-0">
-                <Plus size={18} />
-              </button>
-            </div>
+            )}
           </div>
 
           {/* Snap To */}
@@ -3256,31 +3488,6 @@ export function DotArtTool() {
             </div>
           </div>
 
-        </div>
-
-        {/* Hand Draw (webcam) — pinned above the status line, always visible regardless of scroll */}
-        <div className="bg-[var(--card)] rounded-3xl p-3 shrink-0">
-          <button onClick={toggleHandMode}
-            title="Draw with your hand via webcam — hover your index fingertip over a snap point to place a dot"
-            className={`w-full flex items-center gap-3 rounded-xl px-3 py-2.5 transition-all ${handMode ? "bg-[var(--solid)] text-[var(--solid-fg)]" : "bg-[var(--ctl)] text-[var(--txt-1)] hover:bg-[var(--ctl-hover)]"
-              }`}>
-            <Hand size={18} className="shrink-0" />
-            <span className="flex flex-col items-start leading-tight min-w-0">
-              <span className="text-[14px]">{handMode ? "Hand draw on" : "Hand draw off"}</span>
-              <span className={`text-[11px] ${handMode ? "opacity-80" : "text-[var(--txt-3)]"}`}>
-                {handStatus === "loading" ? "Starting camera…"
-                  : handStatus === "ready" ? "Aim fingertip at a dot"
-                    : handStatus === "error" ? "Camera unavailable"
-                      : "Webcam · MediaPipe"}
-              </span>
-            </span>
-          </button>
-        </div>
-
-        {/* Status footer */}
-        <div className="bg-[var(--card)] rounded-3xl p-3 shrink-0 flex items-center justify-between px-4 text-[12px] text-[var(--txt-3)]">
-          <span>{dots.size} dot{dots.size !== 1 ? "s" : ""}</span>
-          <span className="font-mono">{Math.round(zoom * 100)}%</span>
         </div>
 
       </aside>
@@ -3617,89 +3824,161 @@ export function DotArtTool() {
             fill="none" style={{ cursor, pointerEvents: "all" }} />
         </svg>
 
-        {/* Layers panel (floating, top-right) */}
-        <div className="absolute top-4 right-4 z-20 flex flex-col items-end gap-2">
+        {/* Stats + Layers panel (floating, top-right) — same pill height as
+            the Tools cluster and the Undo/Redo cluster for visual consistency. */}
+        <div className="absolute top-4 right-4 z-20 flex items-start gap-2">
+          {/* Dot count + physical canvas size — replaces both the left
+              panel's old status footer and the bottom-left status pill
+              (removed). Size is shown once (WxH unit), not as both grid
+              cell count and physical size. Zoom isn't repeated here either —
+              it's already shown in the bottom-right zoom cluster. */}
+          <div className="h-[43px] px-[14px] flex items-center gap-[7px] rounded-xl text-[12px] backdrop-blur-sm border border-[var(--overlay-border)]/60 shadow-sm bg-[var(--overlay)]/85 text-[var(--overlay-fg)]">
+            <span>{dots.size} dot{dots.size !== 1 ? "s" : ""}</span>
+            <span className="text-[var(--overlay-fg-muted)]">·</span>
+            <span className="font-mono text-[var(--overlay-fg-muted)]">
+              {roundForUnit(canvasPhysW, unit)}×{roundForUnit(canvasPhysH, unit)}{unit === "in" ? "\"" : ` ${unit}`}
+            </span>
+          </div>
+          <div className="flex flex-col items-end gap-2">
           <button onClick={() => setShowLayers((v) => !v)} title="Layers"
-            className={`h-9 px-3 flex items-center gap-1.5 rounded-xl text-[13px] backdrop-blur-sm border border-[var(--overlay-border)]/60 shadow-sm transition-colors ${showLayers ? "bg-[var(--solid)] text-[var(--solid-fg)]" : "bg-[var(--overlay)]/85 text-[var(--overlay-fg)] hover:bg-[var(--ctl-hover)]"}`}>
-            <LayersIcon size={15} /> Layers
+            className={`h-[43px] px-[14px] flex items-center gap-[5px] rounded-xl text-[12px] backdrop-blur-sm border border-[var(--overlay-border)]/60 shadow-sm transition-colors ${showLayers ? "bg-[var(--solid)] text-[var(--solid-fg)]" : "bg-[var(--overlay)]/85 text-[var(--overlay-fg)] hover:bg-[var(--ctl-hover)]"}`}>
+            <LayersIcon size={14} /> Layers
           </button>
           {showLayers && (
-            <div className="w-64 bg-[var(--card)] rounded-2xl p-2 shadow-xl border border-[var(--overlay-border)]/60 flex flex-col gap-2">
+            <div className="w-[230px] bg-[var(--card)] rounded-2xl p-[7px] shadow-xl border border-[var(--overlay-border)]/60 flex flex-col gap-[7px]">
               <div className="flex items-center justify-between px-1">
-                <span className="text-[13px] text-[var(--txt-2)]">Layers</span>
-                <button onClick={addLayer} title="New layer"
-                  className="w-7 h-7 flex items-center justify-center rounded-lg bg-[var(--ctl)] text-[var(--txt-1)] hover:bg-[var(--ctl-hover)] transition-colors">
-                  <Plus size={16} />
-                </button>
+                <span className="text-[12px] text-[var(--txt-2)]">
+                  {mergeSelectCount >= 2 ? `${mergeSelectCount} selected` : "Layers"}
+                </span>
+                <div className="flex items-center gap-1">
+                  {mergeSelectCount >= 2 && (
+                    <button
+                      onClick={() => { mergeLayers(Array.from(mergeSelectIds)); setMergeSelectIds(new Set()); }}
+                      title="Merge selected layers"
+                      className="h-[25px] px-[7px] flex items-center gap-1 rounded-lg bg-[var(--solid)] text-[var(--solid-fg)] hover:opacity-90 transition-colors text-[11px]">
+                      <Combine size={13} /> Merge
+                    </button>
+                  )}
+                  <button onClick={addLayer} title="New layer"
+                    className="w-[25px] h-[25px] flex items-center justify-center rounded-lg bg-[var(--ctl)] text-[var(--txt-1)] hover:bg-[var(--ctl-hover)] transition-colors">
+                    <Plus size={14} />
+                  </button>
+                </div>
               </div>
               <div className="flex flex-col gap-1 max-h-[52vh] overflow-y-auto" style={{ scrollbarWidth: "none" }}>
                 {layers.map((l, i) => ({ l, i })).reverse().map(({ l, i }) => {
                   const active = l.id === activeLayerId;
+                  const picked = mergeSelectIds.has(l.id);
                   return (
                     <div key={l.id} onClick={() => selectLayer(l.id)}
-                      className={`flex items-center gap-1 rounded-xl px-1.5 py-1.5 cursor-pointer transition-colors ${active ? "bg-[var(--solid)]/15 ring-1 ring-[var(--solid)]/40" : "bg-[var(--ctl)] hover:bg-[var(--ctl-hover)]"}`}>
+                      className={`flex items-center gap-1 rounded-xl px-[5px] py-[5px] cursor-pointer transition-colors ${picked ? "ring-1 ring-sky-400/70 bg-sky-400/10" : active ? "bg-[var(--solid)]/15 ring-1 ring-[var(--solid)]/40" : "bg-[var(--ctl)] hover:bg-[var(--ctl-hover)]"}`}>
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setMergeSelectIds((prev) => {
+                            const next = new Set(prev);
+                            next.has(l.id) ? next.delete(l.id) : next.add(l.id);
+                            return next;
+                          });
+                        }}
+                        title={picked ? "Remove from merge selection" : "Pick for merge"}
+                        disabled={layers.length <= 1}
+                        className={`w-[14px] h-[14px] rounded border shrink-0 flex items-center justify-center transition-colors ${picked ? "bg-sky-400 border-sky-400" : "border-[var(--txt-3)] disabled:opacity-25"}`}>
+                        {picked && <Check size={10} className="text-white" />}
+                      </button>
                       <button onClick={(e) => { e.stopPropagation(); toggleLayerVisible(l.id); }} title={l.visible ? "Hide" : "Show"}
-                        className="w-6 h-6 flex items-center justify-center rounded text-[var(--txt-2)] hover:text-[var(--txt-1)] shrink-0">
-                        {l.visible ? <Eye size={15} /> : <EyeOff size={15} />}
+                        className="w-[22px] h-[22px] flex items-center justify-center rounded text-[var(--txt-2)] hover:text-[var(--txt-1)] shrink-0">
+                        {l.visible ? <Eye size={14} /> : <EyeOff size={14} />}
                       </button>
                       <input value={l.name} onChange={(e) => renameLayer(l.id, e.target.value)}
-                        className="flex-1 min-w-0 bg-transparent text-[13px] text-[var(--txt-1)] outline-none" />
-                      <span className="text-[10px] text-[var(--txt-3)] tabular-nums shrink-0 mr-0.5">{l.dots.size}</span>
+                        className="flex-1 min-w-0 bg-transparent text-[12px] text-[var(--txt-1)] outline-none" />
+                      <span className="text-[9px] text-[var(--txt-3)] tabular-nums shrink-0 mr-0.5">{l.dots.size}</span>
                       <button onClick={(e) => { e.stopPropagation(); moveLayer(l.id, 1); }} disabled={i === layers.length - 1} title="Move up"
-                        className="w-6 h-6 flex items-center justify-center rounded text-[var(--txt-2)] hover:text-[var(--txt-1)] disabled:opacity-25 shrink-0"><ChevronUp size={14} /></button>
+                        className="w-[22px] h-[22px] flex items-center justify-center rounded text-[var(--txt-2)] hover:text-[var(--txt-1)] disabled:opacity-25 shrink-0"><ChevronUp size={13} /></button>
                       <button onClick={(e) => { e.stopPropagation(); moveLayer(l.id, -1); }} disabled={i === 0} title="Move down"
-                        className="w-6 h-6 flex items-center justify-center rounded text-[var(--txt-2)] hover:text-[var(--txt-1)] disabled:opacity-25 shrink-0"><ChevronDown size={14} /></button>
+                        className="w-[22px] h-[22px] flex items-center justify-center rounded text-[var(--txt-2)] hover:text-[var(--txt-1)] disabled:opacity-25 shrink-0"><ChevronDown size={13} /></button>
                       <button onClick={(e) => { e.stopPropagation(); duplicateLayer(l.id); }} title="Duplicate"
-                        className="w-6 h-6 flex items-center justify-center rounded text-[var(--txt-2)] hover:text-[var(--txt-1)] shrink-0"><Copy size={13} /></button>
+                        className="w-[22px] h-[22px] flex items-center justify-center rounded text-[var(--txt-2)] hover:text-[var(--txt-1)] shrink-0"><Copy size={12} /></button>
                       <button onClick={(e) => { e.stopPropagation(); deleteLayer(l.id); }} disabled={layers.length <= 1} title="Delete"
-                        className="w-6 h-6 flex items-center justify-center rounded text-[var(--txt-2)] hover:text-[#ef4444] disabled:opacity-25 shrink-0"><Trash2 size={13} /></button>
+                        className="w-[22px] h-[22px] flex items-center justify-center rounded text-[var(--txt-2)] hover:text-[#ef4444] disabled:opacity-25 shrink-0"><Trash2 size={12} /></button>
                     </div>
                   );
                 })}
               </div>
             </div>
           )}
+          </div>
         </div>
 
-        {/* Status pill (bottom-left) */}
-        <div className="absolute bottom-4 left-4 flex items-center gap-2 text-[11px] text-[var(--overlay-fg)] pointer-events-none bg-[var(--overlay)]/80 backdrop-blur-sm rounded-lg px-3 py-1.5 border border-[var(--overlay-border)]/60 shadow-sm">
-          <Ruler size={11} className="text-[var(--overlay-fg-muted)]" />
-          <span className="font-mono">{fmt(canvasPhysW, unit)} × {fmt(canvasPhysH, unit)}</span>
-          <span className="text-[var(--overlay-fg-muted)]">·</span>
-          <span className="font-mono text-[var(--overlay-fg-muted)]">{cols}×{rows}</span>
-          <span className="text-[var(--overlay-fg-muted)]">·</span>
-          <span className="text-[var(--overlay-fg)]">{dots.size} dot{dots.size !== 1 ? "s" : ""}</span>
+        {/* Tools cluster (top-left) — floats on the canvas instead of
+            crowding the left panel; same visual language as the bottom
+            undo/redo pill. In compact mode it drops below the Menu FAB
+            (which also lives at top-4 left-4) so the two don't collide. */}
+        <div className={`absolute left-4 flex items-center gap-1 bg-[var(--overlay)] border border-[var(--overlay-border)] rounded-2xl shadow-sm px-1 py-1 ${compact ? "top-20" : "top-4"}`}>
+          {([
+            { t: "select" as Tool, icon: <MousePointer2 size={17} />, label: "Select (V)" },
+            { t: "draw" as Tool, icon: <Pen size={17} />, label: "Draw (B)" },
+            { t: "erase" as Tool, icon: <Eraser size={17} />, label: "Erase (E)" },
+            { t: "line" as Tool, icon: <Slash size={17} />, label: "Line (L)" },
+            { t: "pen" as Tool, icon: <PenTool size={17} />, label: "Pen (P)" },
+            { t: "shape" as Tool, icon: <Circle size={17} />, label: "Shape (S)" },
+            { t: "array" as Tool, icon: <Repeat size={17} />, label: "Array (A)" },
+          ]).map(({ t, icon, label }) => (
+            <div key={t} className="relative group">
+              <button aria-label={label}
+                onClick={() => {
+                  // Switching away from Pen mid-path discards the pending
+                  // anchors — you can't leave a dangling path around.
+                  if (tool === "pen" && t !== "pen" && penAnchorsRef.current.length > 0) cancelPenPath();
+                  // Same for Array's Curve mode.
+                  if (tool === "array" && t !== "array" && arrayCurveAnchorsRef.current.length > 0) cancelArrayCurve();
+                  setTool(t);
+                  if (t === "select") sfx.toolSelect(); else if (t === "draw" || t === "line" || t === "pen" || t === "shape" || t === "array") sfx.toolDraw(); else sfx.toolErase();
+                  if (t === "draw" || t === "line" || t === "pen" || t === "shape") setInspect("dot");
+                  // Array reuses the current selection as its motif, so it
+                  // joins Select as the tools that don't clear it on switch.
+                  if (t !== "select" && t !== "array") { setSelectedKeys(new Set()); selectedKeysRef.current = new Set(); }
+                }}
+                className={`w-[43px] h-[43px] rounded-xl flex items-center justify-center transition-all ${tool === t ? "bg-[var(--solid)] text-[var(--solid-fg)]" : "text-[var(--overlay-fg)] hover:bg-[var(--ctl-hover)]"
+                  }`}>
+                {icon}
+              </button>
+              <div className="pointer-events-none absolute top-full left-1/2 -translate-x-1/2 mt-2 whitespace-nowrap text-[11px] text-[var(--overlay-fg)] bg-[var(--overlay)] border border-[var(--overlay-border)] rounded-md px-2 py-1 shadow-sm opacity-0 group-hover:opacity-100 transition-opacity delay-150 z-10">
+                {label}
+              </div>
+            </div>
+          ))}
         </div>
 
         {/* Undo / redo cluster (bottom-center) — floats on the canvas so it's
             one tap on iPad without opening the tools panel; targets are kept
             big (48px tall, wide pads) so a finger can't miss mid-flow. */}
-        <div className="absolute bottom-4 left-1/2 -translate-x-1/2 flex items-center gap-0.5 bg-[var(--overlay)] border border-[var(--overlay-border)] rounded-xl shadow-sm px-1 py-1">
+        <div className="absolute bottom-4 left-1/2 -translate-x-1/2 flex items-center gap-0.5 bg-[var(--overlay)] border border-[var(--overlay-border)] rounded-2xl shadow-sm px-1 py-1">
           <button onClick={undo} disabled={undoCount === 0} title="Undo (Ctrl+Z)" aria-label="Undo"
-            className="h-12 px-5 flex items-center justify-center gap-2 rounded-lg hover:bg-[var(--ctl-hover)] text-[var(--overlay-fg)] text-[13px] disabled:opacity-30 disabled:cursor-not-allowed transition-colors select-none touch-none">
-            <Undo2 size={19} /> Undo
+            className="h-[43px] px-[18px] flex items-center justify-center gap-[7px] rounded-xl hover:bg-[var(--ctl-hover)] text-[var(--overlay-fg)] text-[12px] disabled:opacity-30 disabled:cursor-not-allowed transition-colors select-none touch-none">
+            <Undo2 size={17} /> Undo
           </button>
-          <div className="w-px h-5 bg-[var(--overlay-border)] mx-0.5" />
+          <div className="w-px h-[18px] bg-[var(--overlay-border)] mx-0.5" />
           <button onClick={redo} disabled={redoCount === 0} title="Redo (Ctrl+Shift+Z)" aria-label="Redo"
-            className="h-12 px-5 flex items-center justify-center gap-2 rounded-lg hover:bg-[var(--ctl-hover)] text-[var(--overlay-fg)] text-[13px] disabled:opacity-30 disabled:cursor-not-allowed transition-colors select-none touch-none">
-            Redo <Redo2 size={19} />
+            className="h-[43px] px-[18px] flex items-center justify-center gap-[7px] rounded-xl hover:bg-[var(--ctl-hover)] text-[var(--overlay-fg)] text-[12px] disabled:opacity-30 disabled:cursor-not-allowed transition-colors select-none touch-none">
+            Redo <Redo2 size={17} />
           </button>
-          <div className="w-px h-5 bg-[var(--overlay-border)] mx-0.5" />
+          <div className="w-px h-[18px] bg-[var(--overlay-border)] mx-0.5" />
           <button onClick={toggleRuler} aria-pressed={rulerOn} aria-label="Toggle magnetic ruler"
             title={rulerOn ? "Magnetic ruler on — strokes straighten onto a line (tap to turn off for curves)" : "Magnetic ruler off — strokes follow the hand freely"}
-            className={`h-12 px-4 flex items-center justify-center rounded-lg text-[13px] transition-colors select-none touch-none ${rulerOn ? "bg-[var(--solid)] text-[var(--solid-fg)]" : "text-[var(--overlay-fg)] hover:bg-[var(--ctl-hover)]"}`}>
-            <Ruler size={19} />
+            className={`h-[43px] px-[14px] flex items-center justify-center rounded-xl text-[12px] transition-colors select-none touch-none ${rulerOn ? "bg-[var(--solid)] text-[var(--solid-fg)]" : "text-[var(--overlay-fg)] hover:bg-[var(--ctl-hover)]"}`}>
+            <Ruler size={17} />
           </button>
-          <div className="w-px h-5 bg-[var(--overlay-border)] mx-0.5" />
+          <div className="w-px h-[18px] bg-[var(--overlay-border)] mx-0.5" />
           <button onClick={toggleMirrorX} aria-pressed={mirrorX} aria-label="Toggle left-right mirror"
             title={mirrorX ? "Left-right mirror on — every dot reflects across the vertical center" : "Left-right mirror off"}
-            className={`h-12 px-4 flex items-center justify-center rounded-lg text-[13px] transition-colors select-none touch-none ${mirrorX ? "bg-[var(--solid)] text-[var(--solid-fg)]" : "text-[var(--overlay-fg)] hover:bg-[var(--ctl-hover)]"}`}>
-            <FlipHorizontal2 size={19} />
+            className={`h-[43px] px-[14px] flex items-center justify-center rounded-xl text-[12px] transition-colors select-none touch-none ${mirrorX ? "bg-[var(--solid)] text-[var(--solid-fg)]" : "text-[var(--overlay-fg)] hover:bg-[var(--ctl-hover)]"}`}>
+            <FlipHorizontal2 size={17} />
           </button>
           <button onClick={toggleMirrorY} aria-pressed={mirrorY} aria-label="Toggle top-bottom mirror"
             title={mirrorY ? "Top-bottom mirror on — every dot reflects across the horizontal center" : "Top-bottom mirror off"}
-            className={`h-12 px-4 flex items-center justify-center rounded-lg text-[13px] transition-colors select-none touch-none ${mirrorY ? "bg-[var(--solid)] text-[var(--solid-fg)]" : "text-[var(--overlay-fg)] hover:bg-[var(--ctl-hover)]"}`}>
-            <FlipVertical2 size={19} />
+            className={`h-[43px] px-[14px] flex items-center justify-center rounded-xl text-[12px] transition-colors select-none touch-none ${mirrorY ? "bg-[var(--solid)] text-[var(--solid-fg)]" : "text-[var(--overlay-fg)] hover:bg-[var(--ctl-hover)]"}`}>
+            <FlipVertical2 size={17} />
           </button>
         </div>
 
@@ -3747,12 +4026,6 @@ export function DotArtTool() {
           <div className="w-px h-4 bg-[var(--overlay-border)] mx-0.5" />
           <button onClick={fitToViewport} title="Fit to view" className="w-7 h-7 flex items-center justify-center rounded hover:bg-[var(--ctl-hover)] text-[var(--overlay-fg-muted)] transition-colors"><Maximize2 size={12} /></button>
         </div>
-
-        {!compact && (
-          <div className="absolute top-4 left-4 text-[11px] text-[var(--overlay-fg-muted)] pointer-events-none">
-            Scroll zoom · Space+drag pan · B/E/V tools · Alt+click eyedropper · Ctrl+C/V copy · Ctrl+D dup · ⌫ delete · Arrows nudge
-          </div>
-        )}
 
         {/* Spacing-sequence HUD: the last few gaps between placed dots, in
             subgrid steps — so a manual ramp (5, 6, 8, …) can be kept
@@ -4226,63 +4499,55 @@ export function DotArtTool() {
 
         {/* Export / footer card */}
         <div className="bg-[var(--card)] rounded-3xl p-3 shrink-0 flex flex-col gap-2">
-          {/* Editable project: save / reopen (separate from the image exports below) */}
+          {/* Editable project: save / reopen */}
           <div className="flex gap-2">
             <button onClick={saveProject} title="Download an editable project file"
               className="flex-1 flex items-center justify-center gap-1.5 py-2.5 rounded-xl bg-black text-[#a3bfc8] text-[13px] hover:bg-[#1a1a1a] transition-colors">
               <Save size={13} /> Save Project
             </button>
-            <button onClick={() => fileInputRef.current?.click()} title="Open a saved project file"
-              className="flex-1 flex items-center justify-center gap-1.5 py-2.5 rounded-xl bg-[var(--ctl)] text-[var(--txt-1)] text-[13px] hover:bg-[var(--ctl-hover)] transition-colors">
-              <FolderOpen size={13} /> Open
-            </button>
             <input ref={fileInputRef} type="file" accept="application/json,.json" className="hidden"
               onChange={(e) => { const f = e.target.files?.[0]; if (f) openProjectFile(f); e.target.value = ""; }} />
           </div>
 
-          {/* Image / Text → dots: each opens a modal to tune, preview, then commit */}
-          <div className="flex gap-2">
-            <button onClick={openImportModal} title="Convert an image into editable dots"
-              className="flex-1 flex items-center justify-center gap-1.5 py-2.5 rounded-xl bg-[var(--ctl)] text-[var(--txt-1)] text-[13px] hover:bg-[var(--ctl-hover)] transition-colors">
-              <ImagePlus size={13} /> Image
-            </button>
-            <button onClick={() => { setImportCell(cellPhysical); setTextOpen(true); }} title="Convert typed text in any font into dissolving dots"
-              className="flex-1 flex items-center justify-center gap-1.5 py-2.5 rounded-xl bg-[var(--ctl)] text-[var(--txt-1)] text-[13px] hover:bg-[var(--ctl-hover)] transition-colors">
-              <Type size={13} /> Text
-            </button>
-          </div>
-          <div className="flex gap-2">
-            <button onClick={() => window.open(`${import.meta.env.BASE_URL}image.html`, "_blank")}
-              title="Open the full-screen image tool in a new tab"
-              className="flex-1 flex items-center justify-center gap-1.5 py-2 rounded-xl bg-transparent text-[var(--txt-2)] text-[12px] hover:bg-[var(--ctl)] transition-colors">
-              <ImagePlus size={12} /> Image tool ↗
-            </button>
-            <button onClick={() => window.open(`${import.meta.env.BASE_URL}text.html`, "_blank")}
-              title="Open the full-screen text tool in a new tab"
-              className="flex-1 flex items-center justify-center gap-1.5 py-2 rounded-xl bg-transparent text-[var(--txt-2)] text-[12px] hover:bg-[var(--ctl)] transition-colors">
-              <Type size={12} /> Text tool ↗
-            </button>
+          <div className="h-px bg-[var(--ctl)] mx-1" />
+
+          {/* Export: one button in the last-used format + a dropdown to change it */}
+          <div className="relative">
+            <div className="flex gap-2">
+              <button
+                onClick={() => { if (exportFormat === "svg") exportSVG(); else if (exportFormat === "png") exportPNG(); else exportPDF(); }}
+                className="flex-1 flex items-center justify-center gap-1.5 py-2.5 rounded-xl bg-[var(--ctl)] text-[var(--txt-1)] text-[13px] hover:bg-[var(--ctl-hover)] transition-colors">
+                {exportFormat === "svg" ? <FileCode2 size={13} /> : exportFormat === "png" ? <FileImage size={13} /> : <Printer size={13} />}
+                Export {exportFormat.toUpperCase()}
+              </button>
+              <button onClick={() => setExportMenuOpen((o) => !o)} title="Choose export format" aria-label="Choose export format"
+                className="w-10 shrink-0 flex items-center justify-center rounded-xl bg-[var(--ctl)] text-[var(--txt-1)] hover:bg-[var(--ctl-hover)] transition-colors">
+                {exportMenuOpen ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
+              </button>
+            </div>
+            {exportMenuOpen && (
+              <div className="absolute bottom-full mb-2 left-0 right-0 bg-[var(--card)] border border-[var(--ctl)] rounded-xl shadow-lg overflow-hidden z-10">
+                {([
+                  { f: "svg" as const, label: "SVG", icon: <FileCode2 size={13} /> },
+                  { f: "png" as const, label: "PNG", icon: <FileImage size={13} /> },
+                  { f: "pdf" as const, label: "PDF", icon: <Printer size={13} /> },
+                ]).map(({ f, label, icon }) => (
+                  <button key={f} onClick={() => { setExportFormat(f); setExportMenuOpen(false); }}
+                    className={`w-full flex items-center gap-2 px-3 py-2.5 text-[13px] transition-colors ${exportFormat === f ? "bg-[var(--ctl)] text-[var(--txt-1)]" : "text-[var(--txt-2)] hover:bg-[var(--ctl-hover)]"}`}>
+                    {icon} {label}
+                  </button>
+                ))}
+              </div>
+            )}
           </div>
 
-          <div className="h-px bg-[var(--ctl)] mx-1" />
-          <div className="flex gap-2">
-            <button onClick={exportSVG} className="flex-1 flex items-center justify-center gap-1 py-2.5 rounded-xl bg-[var(--ctl)] text-[var(--txt-1)] text-[13px] hover:bg-[var(--ctl-hover)] transition-colors">
-              <FileCode2 size={13} /> SVG
-            </button>
-            <button onClick={exportPNG} className="flex-1 flex items-center justify-center gap-1 py-2.5 rounded-xl bg-[var(--ctl)] text-[var(--txt-1)] text-[13px] hover:bg-[var(--ctl-hover)] transition-colors">
-              <FileImage size={13} /> PNG
-            </button>
-            <button onClick={exportPDF} className="flex-1 flex items-center justify-center gap-1 py-2.5 rounded-xl bg-[var(--ctl)] text-[var(--txt-1)] text-[13px] hover:bg-[var(--ctl-hover)] transition-colors">
-              <Printer size={13} /> PDF
-            </button>
-          </div>
           <button disabled={dots.size === 0}
             onPointerDown={(e) => { e.preventDefault(); startClearHold(); }}
             onPointerUp={cancelClearHold}
             onPointerLeave={cancelClearHold}
             onPointerCancel={cancelClearHold}
             className="relative w-full overflow-hidden flex items-center justify-center gap-1.5 py-2 rounded-xl text-[13px] text-[#f23a3a] hover:bg-[#f23a3a]/10 disabled:opacity-30 disabled:cursor-not-allowed transition-colors select-none touch-none">
-            <Trash2 size={13} /> {clearProgress > 0 ? "Keep holding to clear…" : "Hold to Clear Canvas"}
+            <Trash2 size={13} /> {clearProgress > 0 ? "Keep holding to clear…" : "Hold to Clear Layer"}
             {clearProgress > 0 && (
               <Progress value={clearProgress}
                 className="absolute bottom-0 inset-x-0 h-1 rounded-none bg-[#f23a3a]/15 [&>*]:bg-[#f23a3a] [&>*]:transition-none" />
@@ -4303,7 +4568,7 @@ export function DotArtTool() {
         <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/50 p-4"
           onClick={closeImport}>
           <div onClick={(e) => e.stopPropagation()}
-            className="dotart bg-[var(--card)] text-[var(--txt-1)] rounded-3xl p-5 w-[80vw] h-[80vh] max-w-[1600px] max-h-[92vh] flex flex-col gap-4 shadow-2xl">
+            className="dotart bg-[var(--card)] text-[var(--txt-1)] rounded-3xl p-5 w-[94vw] h-[94vh] max-w-[2000px] max-h-[97vh] flex flex-col gap-4 shadow-2xl">
             <div className="flex items-center justify-between shrink-0">
               <h2 className="text-[16px] font-medium flex items-center gap-2"><ImagePlus size={16} /> Import Image</h2>
               <button onClick={closeImport}
@@ -4336,7 +4601,7 @@ export function DotArtTool() {
                   <div className="flex gap-1">
                     {([["palette", "Colors"], ["tonal", "Light & Shadow"]] as const).map(([s, lbl]) => (
                       <button key={s} onClick={() => setImgStyle(s)}
-                        className={`flex-1 py-1.5 px-1 rounded-lg text-[11px] leading-tight transition-colors ${imgStyle === s ? "bg-[var(--solid)] text-white" : "bg-[var(--ctl)] text-[var(--txt-2)] hover:bg-[var(--ctl-hover)]"}`}>
+                        className={`flex-1 py-1.5 px-1 rounded-lg text-[11px] leading-tight transition-colors ${imgStyle === s ? "bg-[var(--solid)] text-[var(--solid-fg)]" : "bg-[var(--ctl)] text-[var(--txt-2)] hover:bg-[var(--ctl-hover)]"}`}>
                         {lbl}
                       </button>
                     ))}
@@ -4359,6 +4624,23 @@ export function DotArtTool() {
                     <div className="mt-3">
                       <ValueSlider label="Colors" min={1} max={32} step={1} value={traceColorCount}
                         display={`${traceColorCount}`} onChange={setTraceColorCount} />
+
+                      <label className="flex items-center gap-2 mt-3 text-[12px] text-[var(--txt-2)] cursor-pointer">
+                        <input type="checkbox" checked={traceGlitch}
+                          onChange={(e) => setTraceGlitch(e.target.checked)}
+                          className="accent-[var(--solid)]" />
+                        Glitch
+                      </label>
+                      {traceGlitch && (
+                        <div className="mt-2">
+                          <ValueSlider label="Amount" min={1} max={20} step={1} value={traceGlitchAmount}
+                            display={`${traceGlitchAmount}`} onChange={setTraceGlitchAmount} />
+                          <p className="text-[11px] text-[var(--txt-3)] leading-snug mt-1.5">
+                            Red/blue channels sampled offset from green — a chromatic-aberration tear.
+                          </p>
+                        </div>
+                      )}
+
                       {basePalette && effectivePalette && (
                         <>
                           <div className="flex flex-wrap gap-1.5 mt-2.5">
@@ -4388,7 +4670,7 @@ export function DotArtTool() {
                 <div className="pt-4 border-t border-[var(--overlay-border)]">
                   <div className="text-[13px] font-medium text-[var(--txt-2)] tracking-[-0.3px] mb-2">Appearance</div>
                   <div className="flex flex-col gap-2.5">
-                    <ValueSlider label="Dot size" min={2} max={20} step={0.5} value={traceDotSize}
+                    <ValueSlider label="Dot size" min={1} max={20} step={0.5} value={traceDotSize}
                       display={`${traceDotSize}`} onChange={setTraceDotSize} />
                     <ValueSlider label={imgStyle === "tonal" ? "Shadow" : "Density"} min={0} max={1} step={0.01} value={traceThreshold}
                       display={traceThreshold.toFixed(2)} onChange={setTraceThreshold} />
@@ -4443,7 +4725,7 @@ export function DotArtTool() {
                     <div className="flex gap-1">
                       {([["corner", "Coarse"], ["both", "Fine"], ["fine", "Sub-grid"]] as const).map(([s, lbl]) => (
                         <button key={s} onClick={() => setTraceDetail(s)}
-                          className={`flex-1 py-1.5 rounded-lg text-[12px] transition-colors ${traceDetail === s ? "bg-[var(--solid)] text-white" : "bg-[var(--ctl)] text-[var(--txt-2)] hover:bg-[var(--ctl-hover)]"}`}>
+                          className={`flex-1 py-1.5 rounded-lg text-[12px] transition-colors ${traceDetail === s ? "bg-[var(--solid)] text-[var(--solid-fg)]" : "bg-[var(--ctl)] text-[var(--txt-2)] hover:bg-[var(--ctl-hover)]"}`}>
                           {lbl}
                         </button>
                       ))}
@@ -4452,6 +4734,15 @@ export function DotArtTool() {
                       {importDims ? `${importDims.cols}×${importDims.rows} cells` : "—"} · {previewDots ? `${previewDots.size} dots` : "—"}. Smaller cell = finer grid.
                     </p>
                   </div>
+
+                  {imgStyle === "palette" && (
+                    <label className="flex items-center gap-2 mt-3 text-[12px] text-[var(--txt-2)] cursor-pointer">
+                      <input type="checkbox" checked={splitLayersByColor}
+                        onChange={(e) => setSplitLayersByColor(e.target.checked)}
+                        className="accent-[var(--solid)]" />
+                      Split into layers by color
+                    </label>
+                  )}
                 </div>
               </div>
             </div>
@@ -4460,7 +4751,7 @@ export function DotArtTool() {
               <button onClick={closeImport}
                 className="px-4 py-2.5 rounded-xl bg-[var(--ctl)] text-[13px] hover:bg-[var(--ctl-hover)]">Cancel</button>
               <button onClick={addImportToCanvas} disabled={!previewDots || previewDots.size === 0}
-                className="px-5 py-2.5 rounded-xl bg-[var(--solid)] text-white text-[13px] disabled:opacity-40 disabled:cursor-not-allowed hover:opacity-90">
+                className="px-5 py-2.5 rounded-xl bg-[var(--solid)] text-[var(--solid-fg)] text-[13px] disabled:opacity-40 disabled:cursor-not-allowed hover:opacity-90">
                 Add to canvas
               </button>
             </div>
@@ -4506,7 +4797,7 @@ export function DotArtTool() {
                   <div className="flex gap-1">
                     {([["color", "Color"], ["mono", "Mono"], ["tonal", "Light & Shadow"]] as const).map(([s, lbl]) => (
                       <button key={s} onClick={() => setTraceStyle(s)}
-                        className={`flex-1 py-1.5 px-1 rounded-lg text-[11px] leading-tight transition-colors ${traceStyle === s ? "bg-[var(--solid)] text-white" : "bg-[var(--ctl)] text-[var(--txt-2)] hover:bg-[var(--ctl-hover)]"}`}>
+                        className={`flex-1 py-1.5 px-1 rounded-lg text-[11px] leading-tight transition-colors ${traceStyle === s ? "bg-[var(--solid)] text-[var(--solid-fg)]" : "bg-[var(--ctl)] text-[var(--txt-2)] hover:bg-[var(--ctl-hover)]"}`}>
                         {lbl}
                       </button>
                     ))}
@@ -4565,7 +4856,7 @@ export function DotArtTool() {
                   <div className="flex gap-1">
                     {([["corner", "Coarse"], ["both", "Fine"], ["fine", "Sub-grid"]] as const).map(([s, lbl]) => (
                       <button key={s} onClick={() => setTraceDetail(s)}
-                        className={`flex-1 py-1.5 rounded-lg text-[12px] transition-colors ${traceDetail === s ? "bg-[var(--solid)] text-white" : "bg-[var(--ctl)] text-[var(--txt-2)] hover:bg-[var(--ctl-hover)]"}`}>
+                        className={`flex-1 py-1.5 rounded-lg text-[12px] transition-colors ${traceDetail === s ? "bg-[var(--solid)] text-[var(--solid-fg)]" : "bg-[var(--ctl)] text-[var(--txt-2)] hover:bg-[var(--ctl-hover)]"}`}>
                         {lbl}
                       </button>
                     ))}
@@ -4581,12 +4872,26 @@ export function DotArtTool() {
               <button onClick={closeText}
                 className="px-4 py-2.5 rounded-xl bg-[var(--ctl)] text-[13px] hover:bg-[var(--ctl-hover)]">Cancel</button>
               <button onClick={addTextToCanvas} disabled={!textDots}
-                className="px-5 py-2.5 rounded-xl bg-[var(--solid)] text-white text-[13px] disabled:opacity-40 disabled:cursor-not-allowed hover:opacity-90">
+                className="px-5 py-2.5 rounded-xl bg-[var(--solid)] text-[var(--solid-fg)] text-[13px] disabled:opacity-40 disabled:cursor-not-allowed hover:opacity-90">
                 Add to canvas
               </button>
             </div>
           </div>
         </div>
+      )}
+
+      {showHome && (
+        <HomeScreen
+          onOpenProject={openLibraryProject}
+          onCreateNew={createNewProject}
+          onOpenFile={openProjectFileAndRegister}
+          onDeleteActive={notifyProjectDeleted}
+          onOpenImageTool={() => window.open(`${import.meta.env.BASE_URL}image.html`, "_blank")}
+          onOpenTextTool={() => window.open(`${import.meta.env.BASE_URL}text.html`, "_blank")}
+          onEnableHandDraw={() => { if (!handMode) toggleHandMode(); onHideHome(); }}
+          refreshSignal={homeRefresh}
+          onClose={onHideHome}
+        />
       )}
     </div>
   );

@@ -178,6 +178,33 @@ export function useLayers(boot: SceneFile | null, clearSelection: () => void) {
     const next = layersRef.current.map((l) => (l.id === id ? { ...l, name } : l));
     setLayers(next); layersRef.current = next;
   }, []);
+  // Merges >=2 layers into one, in their existing stack order (bottom-most
+  // selected layer's dots first, so a higher selected layer's dot wins on a
+  // key collision — matching what's visually on top). The merged layer takes
+  // the topmost selected layer's name and lands in the slot of the lowest
+  // selected layer, so its position relative to untouched layers is
+  // unchanged. Structure edit like add/delete/reorder: not on the undo stack,
+  // no confirm (same precedent as delete).
+  const mergeLayers = useCallback((ids: string[]) => {
+    const ls = layersRef.current;
+    const idSet = new Set(ids);
+    const selected = ls.filter((l) => idSet.has(l.id));
+    if (selected.length < 2) return;
+    const combined = new Map<string, Dot>();
+    for (const l of selected) for (const [k, d] of l.dots) combined.set(k, d);
+    const top = selected[selected.length - 1];
+    const merged: Layer = { id: genLayerId(), name: top.name, visible: selected.some((l) => l.visible), dots: combined };
+    let inserted = false;
+    const next: Layer[] = [];
+    for (const l of ls) {
+      if (!idSet.has(l.id)) { next.push(l); continue; }
+      if (!inserted) { next.push(merged); inserted = true; }
+    }
+    setLayers(next); layersRef.current = next;
+    setActiveLayerId(merged.id); activeLayerIdRef.current = merged.id;
+    clearSelectionRef.current();
+    sfx.toggle();
+  }, []);
 
   return {
     layers, setLayers, layersRef,
@@ -185,6 +212,6 @@ export function useLayers(boot: SceneFile | null, clearSelection: () => void) {
     activeLayer, dots, setDots, dotsRef,
     undoCount, redoCount, pushUndo, undo, redo,
     selectLayer, addLayer, duplicateLayer, deleteLayer,
-    moveLayer, toggleLayerVisible, renameLayer,
+    moveLayer, toggleLayerVisible, renameLayer, mergeLayers,
   };
 }

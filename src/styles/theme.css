@@ -183,6 +183,17 @@
   }
 }
 
+/* Theme toggle: circular reveal via the View Transitions API (see
+   toggleTheme in DotArtTool.tsx). The API's own default is a crossfade
+   between the old/new root snapshots — disabled here so only the
+   clip-path circle we animate from JS plays; the old snapshot just sits
+   underneath, revealed by the new one's expanding circle. */
+::view-transition-old(root),
+::view-transition-new(root) {
+  animation: none;
+  mix-blend-mode: normal;
+}
+
 /* Layer-nav feedback (canvas up/down arrows): a one-shot opacity pulse on the
    layer you just switched to (see DotLayer in DotArtTool.tsx — remounted via
    a bumped key so the animation replays each switch), and a small toast

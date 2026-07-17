@@ -87,11 +87,11 @@ export function nearestPaletteIndex(r: number, g: number, b: number, palette: RG
 // built only from pixels that will actually become dots.
 export function buildPaletteDots(
   bitmap: ImageBitmap, w: number, h: number,
-  opts: { colorCount: number; threshold: number; dotRadius: number; snapMode: SnapMode }
+  opts: { colorCount: number; threshold: number; dotRadius: number; snapMode: SnapMode; glitch?: number }
 ): PaletteDots {
   const empty: PaletteDots = { dots: new Map(), palette: [], index: new Map(), counts: [] };
 
-  const samples = sampleImageGrid(bitmap, w, h, opts.snapMode);
+  const samples = sampleImageGrid(bitmap, w, h, opts.snapMode, opts.glitch ?? 0);
   const survivors = samples.filter((s) => s.lum <= opts.threshold);
   if (survivors.length === 0) return empty;
 
