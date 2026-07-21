@@ -52,9 +52,21 @@ export function useLayers(boot: SceneFile | null, clearSelection: () => void) {
 
   // Snapshot the active layer's dots onto the undo stack, tagged with which
   // layer they belong to. Any new action invalidates redo.
+  //
+  // No clone here: every edit path in this app is strict copy-on-write
+  // (`next = new Map(prev); next.set/delete(...)`) and never mutates `prev`
+  // again — so the pre-edit Map reference is already permanently immutable
+  // the moment an edit starts, and is safe to alias directly onto the undo
+  // stack instead of re-cloning it. This used to be a full Map clone (up to
+  // MAX_UNDO=60 of them alive at once), which is why the cap below scales
+  // down on a huge layer — that's now a smaller concern (no clone == no
+  // extra copy beyond what the edit itself already allocates) but the cap
+  // still bounds how many full-size historical Maps stay reachable.
+  const undoCapFor = (size: number) => (size > 20000 ? 15 : size > 5000 ? 30 : MAX_UNDO);
   const pushUndo = useCallback(() => {
-    const snapshot: UndoSnapshot = { layerId: activeLayerIdRef.current, dots: new Map(dotsRef.current) };
-    const newStack = [...undoStackRef.current.slice(-(MAX_UNDO - 1)), snapshot];
+    const snapshot: UndoSnapshot = { layerId: activeLayerIdRef.current, dots: dotsRef.current };
+    const cap = undoCapFor(dotsRef.current.size);
+    const newStack = [...undoStackRef.current.slice(-(cap - 1)), snapshot];
     undoStackRef.current = newStack;
     setUndoCount(newStack.length);
     redoStackRef.current = [];
@@ -80,7 +92,7 @@ export function useLayers(boot: SceneFile | null, clearSelection: () => void) {
       return;
     }
     sfx.undo();
-    redoStackRef.current = [...redoStackRef.current, { layerId: popped.layerId, dots: new Map(targetLayer.dots) }];
+    redoStackRef.current = [...redoStackRef.current, { layerId: popped.layerId, dots: targetLayer.dots }];
     setRedoCount(redoStackRef.current.length);
     undoStackRef.current = undoStackRef.current.slice(0, -1);
     setUndoCount(undoStackRef.current.length);
@@ -103,7 +115,7 @@ export function useLayers(boot: SceneFile | null, clearSelection: () => void) {
       return;
     }
     sfx.redo();
-    undoStackRef.current = [...undoStackRef.current, { layerId: popped.layerId, dots: new Map(targetLayer.dots) }];
+    undoStackRef.current = [...undoStackRef.current, { layerId: popped.layerId, dots: targetLayer.dots }];
     setUndoCount(undoStackRef.current.length);
     redoStackRef.current = redoStackRef.current.slice(0, -1);
     setRedoCount(redoStackRef.current.length);

@@ -66,17 +66,16 @@ try {
   await page.waitForSelector("svg");
   await page.waitForTimeout(600);
 
-  // The canvas svg is the one carrying the grid <line>s; toolbar icons are svgs too.
-  // Park the mouse over the left panel first — hover ghosts, snap halos, and
-  // tool cursors are also svg circles and would pollute the count.
+  // Reads dot state via the dev-only __tangaliyaTest hook (src/app/components/
+  // DotArtTool.tsx) instead of counting SVG <circle>/<rect> DOM nodes — keeps
+  // this suite decoupled from the render layer, which the planned Canvas2D
+  // rewrite will change (dots stop being DOM nodes at all). Still parks the
+  // mouse off-canvas first: unrelated to counting now, but avoids a stray
+  // hover ring in the [data-selection-overlay] checks elsewhere in this file.
   const countDots = async () => {
     await page.mouse.move(130, 850);
     await page.waitForTimeout(120);
-    return page.evaluate(() => {
-      const svgs = [...document.querySelectorAll("svg")];
-      const canvas = svgs.sort((a, b) => b.querySelectorAll("line").length - a.querySelectorAll("line").length)[0];
-      return canvas ? canvas.querySelectorAll("circle, g > rect[rx]").length : -1;
-    });
+    return page.evaluate(() => window.__tangaliyaTest.count());
   };
 
   const cx = 700, cy = 450;
@@ -288,19 +287,13 @@ try {
     check("array: apply multiplies motif", false, "Apply button not found");
   }
 
-  // All placed dots must sit inside the canvas (edges inclusive). The canvas
-  // svg's first <rect> is the background = the canvas bounds in world coords.
+  // All placed dots must sit inside the canvas (edges inclusive).
   const outOfBoundsCount = () =>
     page.evaluate(() => {
-      const svgs = [...document.querySelectorAll("svg")];
-      const canvas = svgs.sort((a, b) => b.querySelectorAll("line").length - a.querySelectorAll("line").length)[0];
-      if (!canvas) return -1;
-      const bg = canvas.querySelector("rect");
-      const w = Number(bg?.getAttribute("width")), h = Number(bg?.getAttribute("height"));
+      const { w, h } = window.__tangaliyaTest.canvasBounds();
       let out = 0;
-      for (const c of canvas.querySelectorAll("circle")) {
-        const x = Number(c.getAttribute("cx")), y = Number(c.getAttribute("cy"));
-        if (x < -0.01 || x > w + 0.01 || y < -0.01 || y > h + 0.01) out++;
+      for (const d of window.__tangaliyaTest.dots()) {
+        if (d.x < -0.01 || d.x > w + 0.01 || d.y < -0.01 || d.y > h + 0.01) out++;
       }
       return out;
     });
@@ -308,18 +301,10 @@ try {
     `${await outOfBoundsCount()} circles out of bounds`);
 
   // Dragging a selection past the edge must stop flush at the wall. The drag
-  // must start ON a dot (else it's a marquee), so compute a real dot's screen
-  // position from its world coords via the SVG's screen transform.
+  // must start ON a dot (else it's a marquee), so read a real dot's screen
+  // position via the test hook (world coords through the live pan/zoom/rot).
   await page.keyboard.press("Control+a");
-  const dragFrom = await page.evaluate(() => {
-    const svgs = [...document.querySelectorAll("svg")];
-    const canvas = svgs.sort((a, b) => b.querySelectorAll("line").length - a.querySelectorAll("line").length)[0];
-    const c = canvas?.querySelector("circle");
-    if (!c) return null;
-    const m = c.getScreenCTM();
-    const x = Number(c.getAttribute("cx")), y = Number(c.getAttribute("cy"));
-    return { x: m.a * x + m.c * y + m.e, y: m.b * x + m.d * y + m.f };
-  });
+  const dragFrom = await page.evaluate(() => window.__tangaliyaTest.dotScreenPos(0));
   await page.mouse.move(dragFrom.x, dragFrom.y);
   await page.mouse.down();
   await page.mouse.move(dragFrom.x + 600, dragFrom.y + 400, { steps: 10 });

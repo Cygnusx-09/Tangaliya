@@ -22,13 +22,11 @@ a free-form raster canvas.
 - **Layers** — add/delete/duplicate/reorder/rename/show-hide, with
   layer-aware undo/redo.
 - **Mirror drawing** — left-right and/or top-bottom symmetry live, on every
-  tool including hand-draw.
+  tool.
 - **Brush strokes** with a tunable snap-reach halo and an optional magnetic
   ruler (Freeform-style straightening).
 - **iPad + Apple Pencil support** — pen draws, one finger pans, two fingers
   pan/pinch-zoom/rotate; multi-finger tap gestures for undo/redo.
-- **Hand-draw mode** — webcam hand tracking (MediaPipe) — draw with your
-  index finger, no pinch gesture required.
 - **Editable projects** — save/open as JSON, with debounced browser
   autosave.
 - **Image → dots and Text → dots** converters, including two standalone
@@ -56,5 +54,5 @@ See [`CONTRIBUTING.md`](./CONTRIBUTING.md).
 
 ## License
 
-MIT — see [`LICENSE`](./LICENSE). Third-party licenses (shadcn/ui,
-MediaPipe) are listed in [`ATTRIBUTIONS.md`](./ATTRIBUTIONS.md).
+MIT — see [`LICENSE`](./LICENSE). Third-party licenses (shadcn/ui) are
+listed in [`ATTRIBUTIONS.md`](./ATTRIBUTIONS.md).

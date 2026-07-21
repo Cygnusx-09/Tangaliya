@@ -13,7 +13,7 @@
 // in, since those need to reach into the live document (applyScene etc).
 
 import { useEffect, useRef, useState } from "react";
-import { Grid2x2, List, Search, Plus, FolderOpen, X, Pencil, Copy, Trash2, ImagePlus, Type, Hand } from "lucide-react";
+import { Grid2x2, List, Search, Plus, FolderOpen, X, Pencil, Copy, Trash2, ImagePlus, Type } from "lucide-react";
 import {
   listProjects, deleteProject, renameProject, duplicateProject,
   type ProjectMeta,
@@ -42,7 +42,6 @@ export interface HomeScreenProps {
   onDeleteActive: (id: string) => void;
   onOpenImageTool: () => void;
   onOpenTextTool: () => void;
-  onEnableHandDraw: () => void;
   onClose: () => void;
   // Bumped by DotArtTool's boot-flush effect after it refreshes the active
   // tile's thumbnail/timestamp on a cold boot — re-lists so that tile isn't
@@ -51,7 +50,7 @@ export interface HomeScreenProps {
   refreshSignal?: number;
 }
 
-export function HomeScreen({ onOpenProject, onCreateNew, onOpenFile, onDeleteActive, onOpenImageTool, onOpenTextTool, onEnableHandDraw, refreshSignal, onClose }: HomeScreenProps) {
+export function HomeScreen({ onOpenProject, onCreateNew, onOpenFile, onDeleteActive, onOpenImageTool, onOpenTextTool, refreshSignal, onClose }: HomeScreenProps) {
   const [projects, setProjects] = useState<ProjectMeta[] | null>(null);
   const [layout, setLayout] = useState<Layout>(() => {
     try { return localStorage.getItem(LAYOUT_KEY) === "list" ? "list" : "grid"; } catch { return "grid"; }
@@ -144,10 +143,7 @@ export function HomeScreen({ onOpenProject, onCreateNew, onOpenFile, onDeleteAct
       </div>
 
       {/* Secondary tools — the full-screen image/text converters are launch
-          points (open in a new tab); Hand Draw is a mode switch (dismisses
-          Home and drops straight into the live editor with the webcam
-          active) rather than a same-kind sibling, so it's pushed to the
-          right edge of the row instead of grouped in with them. */}
+          points, opened in a new tab. */}
       <div className="flex items-center gap-2 px-6 py-2.5 border-b border-[var(--ctl)] shrink-0">
         <span className="text-[11px] text-[var(--txt-3)] mr-1">Tools</span>
         <button onClick={onOpenImageTool} title="Open the full-screen image tool in a new tab"
@@ -157,10 +153,6 @@ export function HomeScreen({ onOpenProject, onCreateNew, onOpenFile, onDeleteAct
         <button onClick={onOpenTextTool} title="Open the full-screen text tool in a new tab"
           className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[var(--ctl)] text-[var(--txt-2)] text-[12px] hover:bg-[var(--ctl-hover)] hover:text-[var(--txt-1)] transition-colors">
           <Type size={12} /> Text tool ↗
-        </button>
-        <button onClick={onEnableHandDraw} title="Draw with your hand via webcam — hover your index fingertip over a snap point to place a dot"
-          className="ml-auto flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[var(--ctl)] text-[var(--txt-2)] text-[12px] hover:bg-[var(--ctl-hover)] hover:text-[var(--txt-1)] transition-colors">
-          <Hand size={12} /> Hand Draw
         </button>
       </div>
 

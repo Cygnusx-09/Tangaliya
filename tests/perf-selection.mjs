@@ -19,6 +19,7 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PORT = 5200;
 const URL = process.env.PERF_URL || `http://localhost:${PORT}`;
 const ELAPSED_BUDGET_MS = 150; // ~2 orders of magnitude below the documented 1.3-1.9s freeze
+const CANVAS_BUDGET_MS = 150; // regression guard for the Canvas2D render-layer swap, see check 7 below
 
 const results = [];
 function check(name, ok, detail = "") {
@@ -55,14 +56,25 @@ try {
   await page.waitForSelector("svg");
   await page.waitForTimeout(600);
 
+  // Home now shows on a cold open (fresh profile = no sessionStorage flag
+  // yet, see CLAUDE.md's "Home screen" section) and would otherwise
+  // intercept the Image-button click below. Dismiss it the same way
+  // smoke.mjs does.
+  const createNewBtn = page.getByRole("button", { name: /create new/i }).first();
+  if (await createNewBtn.isVisible().catch(() => false)) {
+    await createNewBtn.click();
+    await page.waitForTimeout(200);
+  }
+
+  // Reads dot state via the dev-only __tangaliyaTest hook (src/app/components/
+  // DotArtTool.tsx) instead of counting SVG <circle>/<rect> DOM nodes — keeps
+  // this harness decoupled from the render layer, which the planned Canvas2D
+  // rewrite will change. [data-selection-overlay] stays a DOM read below
+  // (SelectionOverlay stays SVG even after that rewrite).
   const countDots = async () => {
     await page.mouse.move(130, 850);
     await page.waitForTimeout(120);
-    return page.evaluate(() => {
-      const svgs = [...document.querySelectorAll("svg")];
-      const canvas = svgs.sort((a, b) => b.querySelectorAll("line").length - a.querySelectorAll("line").length)[0];
-      return canvas ? canvas.querySelectorAll("circle, g > rect[rx]").length : -1;
-    });
+    return page.evaluate(() => window.__tangaliyaTest.count());
   };
 
   const overlayStats = () => page.evaluate(() => ({
@@ -70,18 +82,11 @@ try {
     rects: document.querySelectorAll("[data-selection-overlay] rect").length,
   }));
 
-  // Anchor for a small marquee: a real dot's screen position (via its
-  // getScreenCTM, same technique smoke.mjs uses for its edge-drag test) —
-  // more robust than computing a fraction of canvas world-space, which
-  // doesn't account for the fit-to-view zoom/pan applied after import.
-  const anyDotScreenPos = () => page.evaluate(() => {
-    const svgs = [...document.querySelectorAll("svg")];
-    const canvas = svgs.sort((a, b) => b.querySelectorAll("line").length - a.querySelectorAll("line").length)[0];
-    const c = canvas.querySelector("circle");
-    const m = c.getScreenCTM();
-    const x = Number(c.getAttribute("cx")), y = Number(c.getAttribute("cy"));
-    return { x: m.a * x + m.c * y + m.e, y: m.b * x + m.d * y + m.f };
-  });
+  // Anchor for a small marquee: a real dot's screen position via the test
+  // hook (world coords through the live pan/zoom/rot) — more robust than
+  // computing a fraction of canvas world-space, which doesn't account for
+  // the fit-to-view zoom/pan applied after import.
+  const anyDotScreenPos = () => page.evaluate(() => window.__tangaliyaTest.dotScreenPos(0));
 
   // 1 — synthesize a large, detailed source image entirely in-browser (no
   // committed binary asset, no new dependency). A smooth gradient plus
@@ -165,6 +170,13 @@ try {
   await page.keyboard.press("v");
   await page.waitForTimeout(200);
   const dragAnchor = await anyDotScreenPos();
+  // A press-drag only moves dots when it starts on an ALREADY-selected dot
+  // (see DotArtTool.tsx's select-tool pointerdown handler and CLAUDE.md) —
+  // anything else starts a marquee instead. So select the anchor with a
+  // plain click first, then drag it, to actually exercise the drag-ghost
+  // "grabbing" cursor path rather than the marquee one.
+  await page.mouse.click(dragAnchor.x, dragAnchor.y);
+  await page.waitForTimeout(100);
   await page.mouse.move(dragAnchor.x, dragAnchor.y);
   await page.mouse.down();
   await page.mouse.move(dragAnchor.x + 40, dragAnchor.y + 20, { steps: 4 });
@@ -238,6 +250,40 @@ try {
   check("perf: small marquee (below threshold) selects via per-dot rings",
     smallStats.rects === 0 && smallStats.circles > 0,
     `${smallStats.circles} ring(s) in ${dragElapsed}ms (informational, not budget-gated)`);
+
+  // 7 — the actual regression guard for the Canvas2D render-layer swap: does
+  // drawScene's full redraw of the whole 40k+-dot layer stay fast enough to
+  // not be felt, for the two things that now trigger a full redraw every
+  // time — placing a single new dot, and a single pan step (both are in
+  // drawScene's dependency array: `layers` changes on every dot edit, `pan`
+  // changes on every pan tick). Before the swap this concern didn't exist in
+  // the same way (SVG's <g transform> repositioning on pan was cheap
+  // regardless of dot count); this budget is deliberately generous (well
+  // under a frame budget at 60fps would be ~16ms, but this guards against a
+  // regression, not chasing perfection) since a synthetic single Playwright
+  // event round-trip carries its own overhead beyond just the redraw itself.
+  await page.mouse.move(130, 850);
+  await page.keyboard.press("Escape");
+  await page.keyboard.press("b");
+  await page.waitForTimeout(150);
+  const placeT0 = await page.evaluate(() => performance.now());
+  await page.mouse.click(900, 300); // an out-of-the-way empty spot
+  const placeT1 = await page.evaluate(
+    () => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve(performance.now()))))
+  );
+  check(`perf: single dot placement (drawScene redraw of 40k+ dots) under ${CANVAS_BUDGET_MS}ms`,
+    (placeT1 - placeT0) < CANVAS_BUDGET_MS, `${(placeT1 - placeT0).toFixed(1)}ms`);
+
+  await page.mouse.move(700, 450);
+  await page.mouse.down({ button: "middle" });
+  const panT0 = await page.evaluate(() => performance.now());
+  await page.mouse.move(740, 470, { steps: 1 });
+  const panT1 = await page.evaluate(
+    () => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve(performance.now()))))
+  );
+  await page.mouse.up({ button: "middle" });
+  check(`perf: single pan step (drawScene redraw of 40k+ dots + grid) under ${CANVAS_BUDGET_MS}ms`,
+    (panT1 - panT0) < CANVAS_BUDGET_MS, `${(panT1 - panT0).toFixed(1)}ms`);
 
   await browser.close();
 } finally {

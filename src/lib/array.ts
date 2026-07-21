@@ -4,7 +4,8 @@
 // React/ref coupling — see ARCHITECTURE.md.
 
 import type { Dot } from "@/lib/dots";
-import { keyFromPosition, farEnough, inBounds } from "@/lib/snap";
+import { HALF_CELL } from "@/lib/dots";
+import { keyFromPosition, inBounds, SpatialHash, farEnoughFast } from "@/lib/snap";
 import { pathPolyline, pathLength, pointAtArcLength } from "@/lib/path";
 
 export type ArrayMode = "linear" | "grid" | "curve";
@@ -114,11 +115,21 @@ export function applyMotifTransform(motif: Dot[], pivot: { x: number; y: number 
 // commit, so what the user sees is exactly what gets written: for every
 // transform, rotate+translate a copy of the motif, snap each dot to the
 // active lattice, and gate it through the app-wide min-spacing floor exactly
-// like every other placement path (commitLineDots, draw, brush, hand-draw).
+// like every other placement path (commitLineDots, draw, brush).
 // `existing` is read AND incrementally extended as the batch builds, so
 // already-placed instances within this same array batch also count against
 // the floor, not just pre-existing canvas dots. Dedupes by key. Returns only
 // the newly-touched entries (not merged with `existing`).
+//
+// This is the LIVE PREVIEW's pipeline too — it reruns on every slider tweak,
+// not just on Apply — so it can't afford to clone `existing` (a full Map
+// copy) or brute-scan it per candidate the way farEnough does; both are O(n)
+// per call/candidate and `existing` can be a canvas's entire dot count.
+// Spatially indexed instead: one O(n) hash build per call (same order as the
+// clone it replaces, but only once, not per candidate), then each candidate's
+// spacing check is a narrow hash query. New placements are inserted into the
+// same hash as they're accepted, so within-batch spacing keeps working
+// exactly like the old `working` map did.
 export function computeArrayPlacements(
   motif: Dot[],
   transforms: Transform[],
@@ -130,15 +141,17 @@ export function computeArrayPlacements(
 ): Map<string, Dot> {
   if (motif.length === 0 || transforms.length === 0) return new Map();
   const pivot = motifPivot(motif);
-  const working = new Map(existing) as Map<string, { x: number; y: number }>;
   const placed = new Map<string, Dot>();
+  const hash = new SpatialHash<{ x: number; y: number }>(Math.max(minDistPx, HALF_CELL));
+  hash.build(existing.values());
   for (const t of transforms) {
     for (const d of applyMotifTransform(motif, pivot, t)) {
       const pos = keyFromPosition(d.x, d.y, spacing);
       if (!inBounds(pos.x, pos.y, canvasW, canvasH)) continue;
-      if (!working.has(pos.key) && !farEnough(pos.x, pos.y, working, minDistPx)) continue;
+      const alreadyPlaced = existing.has(pos.key) || placed.has(pos.key);
+      if (!alreadyPlaced && !farEnoughFast(hash, pos.x, pos.y, minDistPx)) continue;
       const dot: Dot = { ...d, key: pos.key, x: pos.x, y: pos.y };
-      working.set(pos.key, { x: pos.x, y: pos.y });
+      if (!alreadyPlaced) hash.insert({ x: pos.x, y: pos.y });
       placed.set(pos.key, dot);
     }
   }

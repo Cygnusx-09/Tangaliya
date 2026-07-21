@@ -1,7 +1,7 @@
-import { useState, useRef, useCallback, useEffect, useMemo, memo } from "react";
+import { useState, useRef, useCallback, useEffect, useLayoutEffect, useMemo, memo } from "react";
 import { flushSync } from "react-dom";
 import { HexColorPicker } from "react-colorful";
-import { Eraser, Pen, Trash2, ZoomIn, ZoomOut, Maximize2, Undo2, Redo2, MousePointer2, FileImage, FileCode2, Printer, Grid3x3, Magnet, Ruler, Plus, Minus, Droplet, PaintBucket, Moon, Sun, Volume2, VolumeX, GripHorizontal, Menu, SlidersHorizontal, Dices, Save, FolderOpen, ImagePlus, Type, FlipHorizontal2, FlipVertical2, Slash, PenTool, Circle, Layers as LayersIcon, Eye, EyeOff, Copy, ChevronUp, ChevronDown, Repeat, Home as HomeIcon, Combine, Check } from "lucide-react";
+import { Eraser, Pen, Trash2, ZoomIn, ZoomOut, Maximize2, Undo2, Redo2, MousePointer2, FileImage, FileCode2, Printer, Grid3x3, Magnet, Ruler, Plus, Minus, Droplet, PaintBucket, Moon, Sun, Volume2, VolumeX, Menu, SlidersHorizontal, Dices, Save, FolderOpen, ImagePlus, Type, FlipHorizontal2, FlipVertical2, Slash, PenTool, Circle, Layers as LayersIcon, Eye, EyeOff, Copy, ChevronUp, ChevronDown, Repeat, Home as HomeIcon, Combine, Check, TriangleAlert } from "lucide-react";
 import { sfx, setSfxMuted } from "../sounds";
 import { Progress } from "./ui/progress";
 import {
@@ -9,7 +9,7 @@ import {
   buildDotsFromImage, buildDotsFromText, renderTextCanvas, type SnapMode, type Dot,
 } from "@/lib/dots";
 import { buildPaletteDots } from "@/lib/palette";
-import { GRID_SUBDIV, FINE_CELL, getFineKey, snapSpacing, getNearestSnap, mirrorSnaps, keyFromPosition, farEnough, filterMinSpacing, inBounds, clampOffsetToCanvas } from "@/lib/snap";
+import { GRID_SUBDIV, FINE_CELL, getFineKey, snapSpacing, getNearestSnap, mirrorSnaps, keyFromPosition, nativeSpacing, filterMinSpacing, inBounds, clampOffsetToCanvas, SpatialHash, farEnoughFast } from "@/lib/snap";
 import { downloadBlob } from "@/lib/download";
 import {
   constrainAngle15, pathPolyline, computePathDots,
@@ -38,89 +38,25 @@ import { HomeScreen } from "./HomeScreen";
 type Tool = "draw" | "erase" | "select" | "line" | "pen" | "shape" | "array";
 const MIN_ZOOM = 0.1;
 const MAX_ZOOM = 20;
+// Screen-space px a mousedown-on-an-unselected-dot can move before it's
+// treated as the start of a marquee drag rather than a plain click-select.
+const SELECT_CLICK_SLOP = 4;
 // Above this many selected dots, SelectionOverlay swaps per-dot rings for one
 // bounding-box rect — inserting thousands of ring <circle>s in one commit is
 // what freezes Ctrl+A on a large layer (see ARCHITECTURE.md). Starting guess,
 // tuned against tests/perf-selection.mjs.
 const LARGE_SELECTION_RING_THRESHOLD = 1000;
 
-// One layer's dots rendered as a single memoized SVG group. Pointermove-driven
-// state (hover, draw preview, drag) re-renders DotArtTool on every mouse move;
-// before this extraction that meant re-creating every dot's <circle>/<rect> in
-// every layer on every one of those. Because `setDots` (see its definition)
-// only ever replaces the ACTIVE layer object in the `layers` array — inactive
-// layer objects keep their reference — React.memo lets an inactive layer skip
-// re-rendering entirely as long as its props stay referentially/shallowly
-// equal. That's why the call site MUST pass constant props (selectedKeys:
-// null, isDragging: false, moveDx/moveDy: 0) to every inactive layer instead
-// of the live values — otherwise selection/drag churn on the active layer
-// would change every layer's props and defeat the memo. Selection/hover RINGS
-// live in the sibling SelectionOverlay component below, not here — see its
-// comment for why.
-function DotLayerImpl(props: {
-  layer: Layer; isActive: boolean; dotShape: DotShape; zoom: number;
-  selectedKeys: Set<string> | null;   // null for inactive layers
-  isDragging: boolean; moveDx: number; moveDy: number;
-  // Increments only for the active layer when the user switches layers via
-  // the canvas nav arrows — bumps the inner <g>'s key so it remounts and
-  // replays the one-shot "you're now looking at this layer" opacity pulse
-  // (see .dotart-layer-pulse in theme.css). Left undefined for inactive
-  // layers, so it never varies for them and never breaks their memo.
-  pulseKey?: number;
-}) {
-  const { layer, isActive, dotShape, zoom, selectedKeys, isDragging, moveDx, moveDy, pulseKey } = props;
-  return (
-    <g key={pulseKey ?? 0} className={pulseKey ? "dotart-layer-pulse" : undefined}>
-      {Array.from(layer.dots.values()).map((dot) => {
-        const isSelected = isActive && !!selectedKeys?.has(dot.key);
-        const isDraggingThis = isActive && isDragging && isSelected;
-        const cx = isDraggingThis ? dot.x + moveDx : dot.x;
-        const cy = isDraggingThis ? dot.y + moveDy : dot.y;
-        return (
-          <g key={dot.key}>
-            {dotShape === "bar" ? (() => {
-              const b = barRect(cx, cy, dot.radius);
-              return <rect x={b.x} y={b.y} width={b.w} height={b.h} rx={b.rx} fill={dot.color} opacity={isDraggingThis ? 0.7 : 1} />;
-            })() : (
-              <circle cx={cx} cy={cy} r={dot.radius} fill={dot.color} opacity={isDraggingThis ? 0.7 : 1} />
-            )}
-          </g>
-        );
-      })}
-    </g>
-  );
-}
-// Custom equality instead of memo's default shallow-prop-compare: while NOT
-// dragging, isDraggingThis is always false regardless of selectedKeys (see
-// DotLayerImpl body), so the rendered output is provably independent of
-// selectedKeys — but a plain memo() would still bail out of its bailout,
-// because Ctrl+A/marquee selection hands down a brand-new Set every time,
-// and reference inequality alone triggers React to reconcile all N dot
-// elements even though every attribute it would write is identical. That
-// full-list reconciliation (not a DOM write — the values don't change) was
-// the actual remaining cost after the ring extraction below, measured at
-// ~3.6s for 40k dots via tests/perf-selection.mjs. Ignoring selectedKeys
-// unless isDragging is true closes that gap.
-function dotLayerPropsEqual(prev: Parameters<typeof DotLayerImpl>[0], next: Parameters<typeof DotLayerImpl>[0]) {
-  if (prev.layer !== next.layer) return false;
-  if (prev.isActive !== next.isActive) return false;
-  if (prev.dotShape !== next.dotShape) return false;
-  if (prev.zoom !== next.zoom) return false;
-  if (prev.isDragging !== next.isDragging) return false;
-  if (prev.moveDx !== next.moveDx) return false;
-  if (prev.moveDy !== next.moveDy) return false;
-  if (prev.pulseKey !== next.pulseKey) return false;
-  if (next.isDragging && prev.selectedKeys !== next.selectedKeys) return false;
-  return true;
-}
-const DotLayer = memo(DotLayerImpl, dotLayerPropsEqual);
-
-// Selection + hover rings for the active layer, split out of DotLayer so that
-// flipping a huge selection (Ctrl+A on tens of thousands of dots) no longer
-// forces DotLayer's per-dot map to re-run — DotLayer's fill circles don't
-// change when only selectedKeys changes, so its memo now bails out cleanly.
-// Rendered once (not per-layer, unlike DotLayer) since only the active
-// layer's dots are ever selectable/hoverable.
+// Selection + hover rings for the active layer. Dots themselves render to a
+// <canvas> now (drawScene, below) — this stays a standalone SVG overlay,
+// since selection/hover UI is interactive chrome, not artwork. Originally
+// split out of a per-layer DotLayer SVG component specifically so that
+// flipping a huge selection (Ctrl+A on tens of thousands of dots) wouldn't
+// force a full per-dot re-render just because selectedKeys changed
+// reference — DotLayer is gone now that dots aren't DOM nodes at all, but
+// this overlay's own large-selection bbox-fallback (below) is still real
+// and still needed, so it stayed. Rendered once (not per-layer) since only
+// the active layer's dots are ever selectable/hoverable.
 const SelectionOverlay = memo(function SelectionOverlay(props: {
   dots: Map<string, Dot>;
   selectedKeys: Set<string>;
@@ -219,28 +155,14 @@ function hslToHex(h: number, s: number, l: number): string {
   return `#${f(0)}${f(8)}${f(4)}`;
 }
 
-// ── Hand-draw: MediaPipe Tasks Vision (HandLandmarker) ──
-// Loaded on demand from a CDN ESM so it never enters the Vite bundle / npm audit
-// surface. Returns normalized 0–1 landmarks; index fingertip = 8, thumb tip = 4.
-const MP_VERSION = "0.10.18";
-const MP_CDN = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MP_VERSION}`;
-const HAND_MODEL = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task";
-let visionPromise: Promise<{ vision: any; fileset: any }> | null = null;
-function loadVision(): Promise<{ vision: any; fileset: any }> {
-  if (!visionPromise) {
-    visionPromise = (async () => {
-      const vision: any = await import(/* @vite-ignore */ MP_CDN);
-      const fileset = await vision.FilesetResolver.forVisionTasks(`${MP_CDN}/wasm`);
-      return { vision, fileset };
-    })();
-  }
-  return visionPromise;
-}
-
-function findDotAt(dots: Map<string, Dot>, wx: number, wy: number): Dot | null {
+// Exact hit test, unchanged — `dots` is now any iterable (a full Map's
+// .values(), or a small pre-filtered candidate array from a spatial hash
+// query) rather than requiring the whole Map, so callers can hand it either
+// the brute set or a hash-narrowed one with no change to the math itself.
+function findDotAt(dots: Iterable<Dot>, wx: number, wy: number): Dot | null {
   let closest: Dot | null = null;
   let closestDist = Infinity;
-  for (const dot of dots.values()) {
+  for (const dot of dots) {
     const d = Math.hypot(dot.x - wx, dot.y - wy);
     if (d <= dot.radius + 4 && d < closestDist) { closest = dot; closestDist = d; }
   }
@@ -259,11 +181,13 @@ function selectionBBox(dots: Map<string, Dot>, keys: Set<string>): { minX: numbe
   return maxX === -Infinity ? null : { minX, minY, maxX, maxY };
 }
 
-function dotsInRect(dots: Map<string, Dot>, wx1: number, wy1: number, wx2: number, wy2: number): Set<string> {
+
+// Exact bbox test, unchanged — same widened-to-Iterable treatment as findDotAt.
+function dotsInRect(dots: Iterable<Dot>, wx1: number, wy1: number, wx2: number, wy2: number): Set<string> {
   const minX = Math.min(wx1, wx2); const maxX = Math.max(wx1, wx2);
   const minY = Math.min(wy1, wy2); const maxY = Math.max(wy1, wy2);
   const result = new Set<string>();
-  for (const dot of dots.values())
+  for (const dot of dots)
     if (dot.x >= minX && dot.x <= maxX && dot.y >= minY && dot.y <= maxY) result.add(dot.key);
   return result;
 }
@@ -404,6 +328,10 @@ export function DotArtTool({ showHome, onShowHome, onHideHome }: DotArtToolProps
     moveLayer, toggleLayerVisible, renameLayer, mergeLayers,
   } = useLayers(boot, clearSelection);
   const [showLayers, setShowLayers] = useState(false);
+  // True while the debounced localStorage autosave is failing (quota
+  // exceeded — see the autosave effect below). Surfaced as a small warning
+  // pill so a silently-broken crash-recovery net isn't invisible.
+  const [autosaveFailed, setAutosaveFailed] = useState(false);
   // Merge-candidate picks in the Layers panel — separate from `activeLayerId`
   // (which layer you're drawing on). Ctrl/Cmd/Shift-click toggles membership;
   // a plain click still activates as before and leaves this untouched.
@@ -412,8 +340,10 @@ export function DotArtTool({ showHome, onShowHome, onHideHome }: DotArtToolProps
   // merge just consumed it) never inflates the panel's "N selected" count.
   const mergeSelectCount = layers.filter((l) => mergeSelectIds.has(l.id)).length;
   // Canvas layer-nav arrows (up = layer above, down = layer below). pulseKey
-  // bumps on every arrow switch so the newly-active DotLayer replays its
-  // one-shot pulse; layerToast shows the landed-on layer's name briefly.
+  // bumps on every arrow switch — was consumed by the now-removed SVG
+  // DotLayer to replay a one-shot "you're now looking at this layer" pulse;
+  // rewiring it to drive an equivalent canvas alpha tween is a follow-up
+  // pass, not yet done. layerToast shows the landed-on layer's name briefly.
   const [layerPulseKey, setLayerPulseKey] = useState(0);
   const [layerToast, setLayerToast] = useState<{ name: string; dir: 1 | -1; id: number } | null>(null);
   const layerToastTimerRef = useRef<number>();
@@ -435,7 +365,7 @@ export function DotArtTool({ showHome, onShowHome, onHideHome }: DotArtToolProps
   }, [dotShape]);
   // Absolute minimum distance between any two dots, in subgrid units — a hard
   // floor applied to every placement path (draw click, brush walk, line/pen/
-  // shape commit, hand-draw), independent of snap mode and of the Line/Pen
+  // shape commit), independent of snap mode and of the Line/Pen
   // Spacing model's own density curve. 1 = no-op (already the finest lattice
   // step); only thins placement once it exceeds the active mode's own spacing.
   const [minSpacing, setMinSpacing] = useState(boot?.minSpacing ?? 3);
@@ -545,7 +475,11 @@ export function DotArtTool({ showHome, onShowHome, onHideHome }: DotArtToolProps
   // The polygon's top edge stays pinned at (0%,0%)-(100%,0%) in both
   // keyframes; only the bottom (leading) edge travels, from a degenerate
   // sliver above the viewport to well past its bottom, so the two vertex
-  // pairs interpolate smoothly with no shape "pop".
+  // pairs interpolate smoothly with no shape "pop". A `filter: blur()` hump
+  // (0 -> 6px -> 0, peaking at the sweep's midpoint, same easing) rides
+  // alongside the clip-path so the wipe line softens while it's moving fast
+  // and sharpens as it decelerates into place, instead of reading as a rigid
+  // geometric cut the whole way.
   const toggleTheme = useCallback(() => {
     sfx.toggle();
     const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
@@ -557,10 +491,16 @@ export function DotArtTool({ showHome, onShowHome, onHideHome }: DotArtToolProps
     transition.ready.then(() => {
       document.documentElement.animate(
         {
+          // Middle clip-path keyframe is the exact linear midpoint of the
+          // start/end polygon (both vertices travel at a constant rate), so
+          // it's a geometric no-op — it exists only to anchor the blur hump
+          // at the sweep's midpoint below.
           clipPath: [
             "polygon(0% 0%, 100% 0%, 100% -65%, 0% -15%)",
+            "polygon(0% 0%, 100% 0%, 100% 25%, 0% 75%)",
             "polygon(0% 0%, 100% 0%, 100% 115%, 0% 165%)",
           ],
+          filter: ["blur(0px)", "blur(6px)", "blur(0px)"],
         },
         { duration: 1400, easing: "cubic-bezier(0.65, 0, 0.35, 1)", pseudoElement: "::view-transition-new(root)" },
       );
@@ -633,6 +573,12 @@ export function DotArtTool({ showHome, onShowHome, onHideHome }: DotArtToolProps
   // offset against it so the selection stops flush at the canvas edge.
   const dragBBoxRef = useRef<{ minX: number; minY: number; maxX: number; maxY: number } | null>(null);
   const snappedOffsetRef = useRef<{ dx: number; dy: number }>({ dx: 0, dy: 0 });
+  // A mousedown that hit an *unselected* dot is ambiguous — it could be a
+  // plain click-to-select, or the start of a marquee drag that happens to
+  // begin on top of a dot (near-unavoidable at high dot density). Held here
+  // until the pointer moves past SELECT_CLICK_SLOP: resolves to a single-dot
+  // select on release, or a marquee if actually dragged.
+  const pendingClickRef = useRef<{ hit: Dot; sx: number; sy: number; world: { wx: number; wy: number } } | null>(null);
   const spaceDownRef = useRef(false);
   const toolRef = useRef<Tool>("draw");
   const colorRef = useRef("#FF2A2A");
@@ -805,10 +751,11 @@ export function DotArtTool({ showHome, onShowHome, onHideHome }: DotArtToolProps
     pushUndo();
     const next = new Map(dotsRef.current);
     const newSelected = new Set<string>();
-    const spacing = snapSpacing(snapModeRef.current);
     const { w, h } = canvasBoundsRef.current;
     for (const dot of source) {
-      const pos = keyFromPosition(dot.x + dx, dot.y + dy, spacing);
+      // Each dot re-keys at ITS OWN lattice resolution, not the tool's
+      // current snapMode — see nativeSpacing's doc comment.
+      const pos = keyFromPosition(dot.x + dx, dot.y + dy, nativeSpacing(dot.key));
       if (!inBounds(pos.x, pos.y, w, h)) continue; // pasting near the edge drops what won't fit
       next.set(pos.key, { ...dot, key: pos.key, x: pos.x, y: pos.y });
       newSelected.add(pos.key);
@@ -883,7 +830,9 @@ export function DotArtTool({ showHome, onShowHome, onHideHome }: DotArtToolProps
     for (const key of selectedKeysRef.current) {
       const dot = dotsRef.current.get(key);
       if (!dot) continue;
-      const pos = keyFromPosition(dot.x + dx, dot.y + dy, spacing);
+      // Each dot re-keys at ITS OWN lattice resolution, not the tool's
+      // current snapMode — see nativeSpacing's doc comment.
+      const pos = keyFromPosition(dot.x + dx, dot.y + dy, nativeSpacing(dot.key));
       base.set(pos.key, { ...dot, key: pos.key, x: pos.x, y: pos.y });
       newSelected.add(pos.key);
     }
@@ -1083,33 +1032,96 @@ export function DotArtTool({ showHome, onShowHome, onHideHome }: DotArtToolProps
     return screenToWorld(e.clientX - rect.left, e.clientY - rect.top);
   }, []);
 
+  // Persistent min-spacing hash for the Draw brush (applyDrawTool/
+  // paintStrokeTo below) — keyed on Map reference identity, same idea as
+  // hitHashRef further down but tracked separately since it's rebuilt/reused
+  // on a different rhythm. Both functions below run entirely inside one
+  // synchronous setDots updater each call (never interleaved with another
+  // setDots call mid-stroke), so `prev` at the start of one call is always
+  // exactly the `next` the previous call returned — meaning "rebuild only
+  // when the Map reference changed" is safe across an ENTIRE stroke, not
+  // just within one call: every new dot gets inserted into this same hash
+  // object as it's added to `next`, and the cache's `dots` pointer is
+  // advanced to `next` at the end of the updater, so the following call
+  // recognizes continuity and skips rebuilding. Any other kind of edit
+  // (undo/redo, a Line/Pen/Shape commit, opening a project) always produces
+  // a genuinely different Map reference, which correctly forces a fresh
+  // rebuild instead of trusting stale buckets. Bucket size tracks
+  // min-spacing directly (SpatialHash.nearby widens its search ring if a
+  // later query radius exceeds it, so a stale bucket size from before a
+  // mid-session Min. Spacing change stays correct, just less optimal).
+  const placeHashRef = useRef<{ dots: Map<string, Dot> | null; hash: SpatialHash<Dot> }>({
+    dots: null, hash: new SpatialHash<Dot>(HALF_CELL),
+  });
+  const ensurePlaceHash = useCallback((dots: Map<string, Dot>, minDist: number) => {
+    const cache = placeHashRef.current;
+    if (cache.dots !== dots) {
+      const hash = new SpatialHash<Dot>(Math.max(minDist, HALF_CELL));
+      hash.build(dots.values());
+      cache.hash = hash;
+      cache.dots = dots;
+    }
+    return cache;
+  }, []);
+
   const applyDrawTool = useCallback((key: string, x: number, y: number) => {
     setDots((prev) => {
       const next = new Map(prev);
       if (toolRef.current === "erase") next.delete(key);
       else {
         const minDist = minSpacingRef.current * FINE_CELL;
+        const { hash } = ensurePlaceHash(prev, minDist);
         // Same-key overwrites (recoloring/redrawing an already-placed dot)
         // always go through — the gate only blocks placing a genuinely new
         // dot too close to a different one.
-        if (!next.has(key) && !farEnough(x, y, next, minDist)) return next;
-        next.set(key, { key, x, y, color: colorRef.current, radius: radiusRef.current });
+        if (!next.has(key) && !farEnoughFast(hash, x, y, minDist)) return next;
+        const dot: Dot = { key, x, y, color: colorRef.current, radius: radiusRef.current };
+        next.set(key, dot);
+        hash.insert(dot);
         if (mirrorXRef.current || mirrorYRef.current) {
           const { w, h } = canvasBoundsRef.current;
           for (const m of mirrorSnaps(x, y, w, h, snapModeRef.current, mirrorXRef.current, mirrorYRef.current)) {
-            if (m.key !== key && (next.has(m.key) || farEnough(m.x, m.y, next, minDist))) next.set(m.key, { key: m.key, x: m.x, y: m.y, color: colorRef.current, radius: radiusRef.current });
+            if (m.key !== key && (next.has(m.key) || farEnoughFast(hash, m.x, m.y, minDist))) {
+              const mdot: Dot = { key: m.key, x: m.x, y: m.y, color: colorRef.current, radius: radiusRef.current };
+              next.set(m.key, mdot);
+              hash.insert(mdot);
+            }
           }
         }
+        placeHashRef.current.dots = next;
       }
       return next;
     });
-  }, []);
+  }, [ensurePlaceHash]);
 
   // ── Area eraser ──────────────────────────────────────────────────────────
   // The eraser is a swept circle, not a snap-point deleter: every dot whose
   // body overlaps the segment from the previous pen sample to this one goes,
   // so fast drags can't skip dots and the slider radius is the real hit area.
   const eraseStrokeRef = useRef<{ x: number; y: number } | null>(null);
+
+  // Persistent spatial hash for the eraser, same continuity trick as
+  // placeHashRef above: an erase stroke is many synchronous setDots calls in
+  // a row, and each call's `prev` is provably the previous call's `next` (no
+  // other setDots call can interleave mid-stroke), so the hash is rebuilt
+  // once per stroke (or whenever some other edit changes the Map reference)
+  // and then kept in sync incrementally — insert never needed here since
+  // erasing only removes, so `remove()` on every deleted dot is enough to
+  // keep it consistent with `next` across the whole stroke.
+  const eraseHashRef = useRef<{ dots: Map<string, Dot> | null; hash: SpatialHash<Dot>; maxRadius: number }>({
+    dots: null, hash: new SpatialHash<Dot>(HALF_CELL), maxRadius: 0,
+  });
+  const ensureEraseHash = useCallback((dots: Map<string, Dot>, reach: number) => {
+    const cache = eraseHashRef.current;
+    if (cache.dots !== dots) {
+      let maxRadius = 0;
+      for (const d of dots.values()) if (d.radius > maxRadius) maxRadius = d.radius;
+      const hash = new SpatialHash<Dot>(Math.max(reach + maxRadius, HALF_CELL));
+      hash.build(dots.values());
+      cache.dots = dots; cache.hash = hash; cache.maxRadius = maxRadius;
+    }
+    return cache;
+  }, []);
 
   const eraseAlong = useCallback((x1: number, y1: number, x2: number, y2: number) => {
     const reach = eraseRadiusRef.current;
@@ -1118,19 +1130,31 @@ export function DotArtTool({ showHome, onShowHome, onHideHome }: DotArtToolProps
       const next = new Map(prev);
       const { w, h } = canvasBoundsRef.current;
       const mx = mirrorXRef.current, my = mirrorYRef.current;
-      for (const d of prev.values()) {
+      const { hash, maxRadius } = ensureEraseHash(prev, reach);
+      // Segment bbox padded by reach + the widest dot radius present narrows
+      // the scan to dots that could possibly overlap the swept capsule,
+      // instead of testing every dot in the layer per sample.
+      const pad = reach + maxRadius;
+      const candidates = hash.inRect(
+        Math.min(x1, x2) - pad, Math.min(y1, y2) - pad,
+        Math.max(x1, x2) + pad, Math.max(y1, y2) + pad
+      );
+      for (const d of candidates) {
+        if (!next.has(d.key)) continue; // already removed earlier in this same call
         if (distToSegment(d.x, d.y, x1, y1, x2, y2) <= reach + d.radius) {
-          next.delete(d.key); changed = true;
+          next.delete(d.key); hash.remove(d); changed = true;
           if (mx || my) {
             for (const m of mirrorSnaps(d.x, d.y, w, h, snapModeRef.current, mx, my)) {
-              if (next.has(m.key)) { next.delete(m.key); changed = true; }
+              const md = next.get(m.key);
+              if (md) { next.delete(m.key); hash.remove(md); changed = true; }
             }
           }
         }
       }
+      if (changed) eraseHashRef.current.dots = next;
       return changed ? next : prev;
     });
-  }, []);
+  }, [ensureEraseHash]);
 
   // ── Brush-style stroke walk ──────────────────────────────────────────────
   // Pointer moves arrive once per frame (Safari coalesces the Pencil's 240Hz
@@ -1266,14 +1290,28 @@ export function DotArtTool({ showHome, onShowHome, onHideHome }: DotArtToolProps
       const next = new Map(prev);
       const { w, h } = canvasBoundsRef.current;
       const minDist = minSpacingRef.current * FINE_CELL;
+      // A local, throwaway hash — one commit is a single synchronous batch
+      // (not spread across multiple calls like the Draw brush), so there's
+      // no reference-identity bookkeeping to do: build once from `prev`,
+      // insert as `pts` land, done. Real win when `pts.length` is large
+      // (Ramp/Taper/Pulse spacing, Array apply, filled Shape) — O(n) build +
+      // O(pts.length) queries instead of O(n × pts.length).
+      const hash = new SpatialHash<Dot>(Math.max(minDist, HALF_CELL));
+      hash.build(prev.values());
       for (const p of pts) {
         // Applies on top of whatever the Spacing model already produced —
         // an absolute floor, even over a deliberately tight Pulse cluster.
-        if (!next.has(p.key) && !farEnough(p.x, p.y, next, minDist)) continue;
-        next.set(p.key, { key: p.key, x: p.x, y: p.y, color: colorRef.current, radius: radiusRef.current });
+        if (!next.has(p.key) && !farEnoughFast(hash, p.x, p.y, minDist)) continue;
+        const dot: Dot = { key: p.key, x: p.x, y: p.y, color: colorRef.current, radius: radiusRef.current };
+        next.set(p.key, dot);
+        hash.insert(dot);
         if (mirrorXRef.current || mirrorYRef.current) {
           for (const m of mirrorSnaps(p.x, p.y, w, h, snapModeRef.current, mirrorXRef.current, mirrorYRef.current)) {
-            if (m.key !== p.key && (next.has(m.key) || farEnough(m.x, m.y, next, minDist))) next.set(m.key, { key: m.key, x: m.x, y: m.y, color: colorRef.current, radius: radiusRef.current });
+            if (m.key !== p.key && (next.has(m.key) || farEnoughFast(hash, m.x, m.y, minDist))) {
+              const mdot: Dot = { key: m.key, x: m.x, y: m.y, color: colorRef.current, radius: radiusRef.current };
+              next.set(m.key, mdot);
+              hash.insert(mdot);
+            }
           }
         }
       }
@@ -1622,21 +1660,29 @@ export function DotArtTool({ showHome, onShowHome, onHideHome }: DotArtToolProps
       const { w: cw, h: ch } = canvasBoundsRef.current;
       const mx = mirrorXRef.current, my = mirrorYRef.current;
       const minDist = minSpacingRef.current * FINE_CELL;
+      const { hash } = ensurePlaceHash(prev, minDist);
       for (const s of steps) {
         if (toolRef.current === "erase") next.delete(s.key);
         else {
-          if (!next.has(s.key) && !farEnough(s.x, s.y, next, minDist)) continue; // too close to an already-placed bead — skip, walk continues
-          next.set(s.key, { key: s.key, x: s.x, y: s.y, color: colorRef.current, radius: radiusRef.current });
+          if (!next.has(s.key) && !farEnoughFast(hash, s.x, s.y, minDist)) continue; // too close to an already-placed bead — skip, walk continues
+          const dot: Dot = { key: s.key, x: s.x, y: s.y, color: colorRef.current, radius: radiusRef.current };
+          next.set(s.key, dot);
+          hash.insert(dot);
           if (mx || my) {
             for (const m of mirrorSnaps(s.x, s.y, cw, ch, snapModeRef.current, mx, my)) {
-              if (m.key !== s.key && (next.has(m.key) || farEnough(m.x, m.y, next, minDist))) next.set(m.key, { key: m.key, x: m.x, y: m.y, color: colorRef.current, radius: radiusRef.current });
+              if (m.key !== s.key && (next.has(m.key) || farEnoughFast(hash, m.x, m.y, minDist))) {
+                const mdot: Dot = { key: m.key, x: m.x, y: m.y, color: colorRef.current, radius: radiusRef.current };
+                next.set(m.key, mdot);
+                hash.insert(mdot);
+              }
             }
           }
         }
       }
+      placeHashRef.current.dots = next;
       return next;
     });
-  }, []);
+  }, [ensurePlaceHash]);
 
   // ── Touch (finger) input: one finger pans, two fingers pan + pinch-zoom ──
   // together. While a pen is actively drawing, touch points are ignored —
@@ -1742,9 +1788,45 @@ export function DotArtTool({ showHome, onShowHome, onHideHome }: DotArtToolProps
     }
   }, []);
 
+  // Hover/click/marquee hit-testing hash — rebuilt lazily only when the
+  // active layer's dots Map reference has changed since the last call. Every
+  // dot edit already produces a brand-new Map (see useLayers.ts), so
+  // reference identity is a free, exact staleness check with no extra
+  // bookkeeping. Bucket size tracks the largest dot radius present in the
+  // layer so a query always covers findDotAt's hit tolerance (radius + 4),
+  // even with the varying per-dot radii tonal image import produces.
+  const hitHashRef = useRef<{ dots: Map<string, Dot> | null; hash: SpatialHash<Dot>; maxRadius: number }>({
+    dots: null, hash: new SpatialHash<Dot>(HALF_CELL), maxRadius: 0,
+  });
+  const ensureHitHash = useCallback((dots: Map<string, Dot>) => {
+    const cache = hitHashRef.current;
+    if (cache.dots !== dots) {
+      let maxRadius = 0;
+      for (const d of dots.values()) if (d.radius > maxRadius) maxRadius = d.radius;
+      const hash = new SpatialHash<Dot>(Math.max(maxRadius + 4, HALF_CELL));
+      hash.build(dots.values());
+      cache.dots = dots; cache.hash = hash; cache.maxRadius = maxRadius;
+    }
+    return cache;
+  }, []);
+  // Same exact math as findDotAt, just pre-filtered to the query point's
+  // neighborhood instead of scanning every dot in the layer.
+  const findDotAtFast = useCallback((dots: Map<string, Dot>, wx: number, wy: number): Dot | null => {
+    const { hash, maxRadius } = ensureHitHash(dots);
+    return findDotAt(hash.nearby(wx, wy, maxRadius + 4), wx, wy);
+  }, [ensureHitHash]);
+  // Same exact bbox math as dotsInRect, pre-filtered to the buckets the
+  // marquee rectangle overlaps.
+  const dotsInRectFast = useCallback((dots: Map<string, Dot>, wx1: number, wy1: number, wx2: number, wy2: number): Set<string> => {
+    const { hash } = ensureHitHash(dots);
+    const minX = Math.min(wx1, wx2), maxX = Math.max(wx1, wx2);
+    const minY = Math.min(wy1, wy2), maxY = Math.max(wy1, wy2);
+    return dotsInRect(hash.inRect(minX, minY, maxX, maxY), wx1, wy1, wx2, wy2);
+  }, [ensureHitHash]);
+
   const handlePointerDown = useCallback((e: React.PointerEvent) => {
     // Only strokes that start on the canvas SVG count — the container div
-    // also holds zoom buttons, panel FABs, and the webcam overlay.
+    // also holds zoom buttons and panel FABs.
     if (!svgRef.current || !svgRef.current.contains(e.target as Node)) return;
 
     // Reclaim keyboard shortcuts from a lingering focused text field. The
@@ -1807,13 +1889,13 @@ export function DotArtTool({ showHome, onShowHome, onHideHome }: DotArtToolProps
 
     // Alt+click = eyedropper: pick a dot's color into the brush (works in any tool)
     if (e.altKey) {
-      const hit = findDotAt(dotsRef.current, world.x, world.y);
+      const hit = findDotAtFast(dotsRef.current, world.x, world.y);
       if (hit) { setColor(hit.color); pushRecentColor(hit.color); }
       return;
     }
 
     if (toolRef.current === "select") {
-      const hit = findDotAt(dotsRef.current, world.x, world.y);
+      const hit = findDotAtFast(dotsRef.current, world.x, world.y);
 
       // Shift = additive: toggle a dot in/out, or union-marquee from current selection
       if (e.shiftKey) {
@@ -1831,18 +1913,24 @@ export function DotArtTool({ showHome, onShowHome, onHideHome }: DotArtToolProps
         return;
       }
 
-      if (hit) {
-        if (!selectedKeysRef.current.has(hit.key)) {
-          const next = new Set([hit.key]);
-          setSelectedKeys(next);
-          selectedKeysRef.current = next;
-        }
+      if (hit && selectedKeysRef.current.has(hit.key)) {
+        // Pressing down on a dot that's already selected drags the whole
+        // selection immediately.
         pushUndo();
         isDraggingDotsRef.current = true;
         dragStartWorldRef.current = { x: world.x, y: world.y };
-        preDragDotsRef.current = new Map(dotsRef.current);
+        // No clone: nothing mutates dotsRef.current in place, and no setDots
+        // call happens between here and the pointerup commit (which reads
+        // preDragDotsRef, then only THEN reassigns dotsRef.current) — so
+        // aliasing the current Map is safe and skips an O(n) copy on every
+        // drag start.
+        preDragDotsRef.current = dotsRef.current;
         dragBBoxRef.current = selectionBBox(dotsRef.current, selectedKeysRef.current);
         snappedOffsetRef.current = { dx: 0, dy: 0 };
+      } else if (hit) {
+        // Hit an unselected dot — ambiguous (see pendingClickRef above).
+        // Deferred to pointermove/pointerup instead of deciding here.
+        pendingClickRef.current = { hit, sx: e.clientX, sy: e.clientY, world: { wx: world.x, wy: world.y } };
       } else {
         setSelectedKeys(new Set());
         selectedKeysRef.current = new Set();
@@ -1954,7 +2042,7 @@ export function DotArtTool({ showHome, onShowHome, onHideHome }: DotArtToolProps
     lastPaintRef.current = snap ? { x: snap.x, y: snap.y } : null;
     rulerRef.current = null;
     setRulerGuide(null);
-  }, [getSVGPoint, applyDrawTool, eraseAlong, pushUndo, pushRecentColor, handleTouchNav, finishPenPath, penDots]);
+  }, [getSVGPoint, applyDrawTool, eraseAlong, pushUndo, pushRecentColor, handleTouchNav, finishPenPath, penDots, findDotAtFast]);
 
   const handleDoubleClick = useCallback((e: React.MouseEvent) => {
     // Select-same-color only makes sense in the select tool. Without this
@@ -1965,9 +2053,9 @@ export function DotArtTool({ showHome, onShowHome, onHideHome }: DotArtToolProps
     if (e.button !== 0) return;
     const world = getSVGPoint(e);
     if (!world) return;
-    const hit = findDotAt(dotsRef.current, world.x, world.y);
+    const hit = findDotAtFast(dotsRef.current, world.x, world.y);
     if (hit) selectSameColor(hit.color);
-  }, [getSVGPoint, selectSameColor]);
+  }, [getSVGPoint, selectSameColor, findDotAtFast]);
 
   const handlePointerMove = useCallback((e: React.PointerEvent) => {
     if (e.pointerType === "touch") {
@@ -1996,6 +2084,19 @@ export function DotArtTool({ showHome, onShowHome, onHideHome }: DotArtToolProps
     if (!world) return;
 
     if (toolRef.current === "select") {
+      if (pendingClickRef.current) {
+        const p = pendingClickRef.current;
+        if (Math.hypot(e.clientX - p.sx, e.clientY - p.sy) <= SELECT_CLICK_SLOP) return;
+        // Moved past click tolerance without the dot ever being selected —
+        // this was always a marquee drag, not a single-dot grab.
+        pendingClickRef.current = null;
+        setSelectedKeys(new Set());
+        selectedKeysRef.current = new Set();
+        marqueeBaseRef.current = new Set();
+        isMarqueeingRef.current = true;
+        marqueeStartRef.current = p.world;
+        setMarqueeBox(null);
+      }
       if (isDraggingDotsRef.current && dragStartWorldRef.current) {
         const rawDx = world.x - dragStartWorldRef.current.x;
         const rawDy = world.y - dragStartWorldRef.current.y;
@@ -2008,13 +2109,13 @@ export function DotArtTool({ showHome, onShowHome, onHideHome }: DotArtToolProps
         setDragOffset({ dx: snappedDx, dy: snappedDy });
       } else if (isMarqueeingRef.current && marqueeStartRef.current) {
         setMarqueeBox({ wx1: marqueeStartRef.current.wx, wy1: marqueeStartRef.current.wy, wx2: world.x, wy2: world.y });
-        const keys = dotsInRect(dotsRef.current, marqueeStartRef.current.wx, marqueeStartRef.current.wy, world.x, world.y);
+        const keys = dotsInRectFast(dotsRef.current, marqueeStartRef.current.wx, marqueeStartRef.current.wy, world.x, world.y);
         const union = new Set(marqueeBaseRef.current);
         for (const k of keys) union.add(k);
         setSelectedKeys(union);
         selectedKeysRef.current = union;
       } else {
-        const hit = findDotAt(dotsRef.current, world.x, world.y);
+        const hit = findDotAtFast(dotsRef.current, world.x, world.y);
         setHoveredDotKey(hit ? hit.key : null);
       }
       return;
@@ -2109,7 +2210,7 @@ export function DotArtTool({ showHome, onShowHome, onHideHome }: DotArtToolProps
         }
       }
     }
-  }, [getSVGPoint, applyDrawTool, paintStrokeTo, handleTouchNav, penDots, spacingOpts, shapeDotsFor]);
+  }, [getSVGPoint, applyDrawTool, paintStrokeTo, handleTouchNav, penDots, spacingOpts, shapeDotsFor, dotsInRectFast, findDotAtFast]);
 
   const handlePointerUp = useCallback((e: React.PointerEvent) => {
     if (e.pointerType === "touch") {
@@ -2137,6 +2238,15 @@ export function DotArtTool({ showHome, onShowHome, onHideHome }: DotArtToolProps
     }
 
     if (toolRef.current === "select") {
+      if (pendingClickRef.current) {
+        // Released without ever exceeding SELECT_CLICK_SLOP — a plain click,
+        // resolved now as select-just-this-dot.
+        const next = new Set([pendingClickRef.current.hit.key]);
+        setSelectedKeys(next);
+        selectedKeysRef.current = next;
+        pendingClickRef.current = null;
+        return;
+      }
       if (isDraggingDotsRef.current) {
         const { dx, dy } = snappedOffsetRef.current;
         if (dx !== 0 || dy !== 0) {
@@ -2146,7 +2256,9 @@ export function DotArtTool({ showHome, onShowHome, onHideHome }: DotArtToolProps
             const dot = preDragDotsRef.current.get(key);
             if (!dot) continue;
             next.delete(key);
-            const newPos = keyFromPosition(dot.x + dx, dot.y + dy);
+            // Each dot re-keys at ITS OWN lattice resolution, not the tool's
+            // current snapMode — see nativeSpacing's doc comment.
+            const newPos = keyFromPosition(dot.x + dx, dot.y + dy, nativeSpacing(dot.key));
             next.set(newPos.key, { ...dot, key: newPos.key, x: newPos.x, y: newPos.y });
             newSelected.add(newPos.key);
           }
@@ -2233,7 +2345,7 @@ export function DotArtTool({ showHome, onShowHome, onHideHome }: DotArtToolProps
     // the first dot, so trails never formed. While any press-driven
     // interaction is live, ignore leave; pointerup/cancel own the real cleanup.
     if (penActiveRef.current || fingerDrawRef.current !== null || isPaintingRef.current ||
-      isPanningRef.current || isDraggingDotsRef.current || isMarqueeingRef.current) return;
+      isPanningRef.current || isDraggingDotsRef.current || isMarqueeingRef.current || pendingClickRef.current) return;
     setPreview(null);
     isPaintingRef.current = false;
     fingerDrawRef.current = null;
@@ -2280,214 +2392,12 @@ export function DotArtTool({ showHome, onShowHome, onHideHome }: DotArtToolProps
     setShapePreview(null);
     isDraggingDotsRef.current = false;
     isMarqueeingRef.current = false;
+    pendingClickRef.current = null;
     setMarqueeBox(null);
   }, []);
 
-  // ── Hand-draw mode ──────────────────────────────────────────────────────
-  // Webcam → MediaPipe HandLandmarker → index fingertip mapped to the canvas.
-  // A pinch (index↔thumb) is "pen down"; it places dots through the same snap
-  // + undo path as the mouse, independent of the active tool (always draws).
-  const [handMode, setHandMode] = useState(false);
-  const [handStatus, setHandStatus] = useState<"off" | "loading" | "ready" | "error">("off");
-  // Floating webcam window — draggable position + resizable width (height locked 4:3).
-  const CAM_ASPECT = 0.75;
-  const [camPos, setCamPos] = useState({ x: 16, y: 16 });
-  const [camW, setCamW] = useState(200);
-  const videoRef = useRef<HTMLVideoElement>(null);
-  const cursorRef = useRef<HTMLDivElement>(null);
-  const overlayRef = useRef<HTMLCanvasElement>(null);
-  const camRef = useRef<HTMLDivElement>(null);
-  const landmarkerRef = useRef<any>(null);
-  const visionRef = useRef<any>(null);
-  const connectionsRef = useRef<any>(null);
-  const drawingUtilsRef = useRef<any>(null);
-  const handModeRef = useRef(false);
-  const handPresentRef = useRef(false);
-  const lastHandKeyRef = useRef<string | null>(null);
-  const handLoopRef = useRef<number>();
   const viewportRef = useRef(viewportSize);
   useEffect(() => { viewportRef.current = viewportSize; }, [viewportSize]);
-  useEffect(() => { handModeRef.current = handMode; }, [handMode]);
-
-  // Move the on-canvas fingertip cursor via direct DOM writes (no re-render at 60fps).
-  const positionCursor = useCallback((sx: number, sy: number, active: boolean, show: boolean) => {
-    const el = cursorRef.current;
-    if (!el) return;
-    el.style.opacity = show ? "1" : "0";
-    el.style.transform = `translate(${sx}px, ${sy}px) translate(-50%, -50%) scale(${active ? 0.62 : 1})`;
-    el.style.background = active ? colorRef.current : "transparent";
-    el.style.borderColor = active ? colorRef.current : "rgba(255,255,255,0.95)";
-  }, []);
-
-  const stopHandLoop = useCallback(() => {
-    if (handLoopRef.current !== undefined) cancelAnimationFrame(handLoopRef.current);
-    handLoopRef.current = undefined;
-    handPresentRef.current = false;
-  }, []);
-
-  const startHandLoop = useCallback(() => {
-    // Fingertip must land within GATE_FACTOR × the snap spacing to drop a dot,
-    // so placement is deliberate instead of a continuous trail. Spacing is the
-    // half-cell (10px world) in "both" mode, a full cell (20px) otherwise.
-    const GATE_FACTOR = 0.4;
-    const tick = () => {
-      const video = videoRef.current;
-      const lmk = landmarkerRef.current;
-      const vp = viewportRef.current;
-      const overlay = overlayRef.current;
-      if (handModeRef.current && lmk && video && video.videoWidth) {
-        let res: any;
-        try { res = lmk.detectForVideo(video, performance.now()); } catch { /* between frames */ }
-        const lms = res?.landmarks?.[0];
-
-        // Draw the hand skeleton onto the webcam preview.
-        if (overlay) {
-          const ctx = overlay.getContext("2d");
-          if (ctx) {
-            ctx.clearRect(0, 0, overlay.width, overlay.height);
-            if (!drawingUtilsRef.current && visionRef.current) drawingUtilsRef.current = new visionRef.current.DrawingUtils(ctx);
-            if (lms && drawingUtilsRef.current) {
-              drawingUtilsRef.current.drawConnectors(lms, connectionsRef.current, { color: "rgba(255,255,255,0.85)", lineWidth: 2 });
-              drawingUtilsRef.current.drawLandmarks(lms, { color: "#ffffff", fillColor: colorRef.current, lineWidth: 1, radius: 3 });
-            }
-          }
-        }
-
-        if (lms) {
-          // First detection after the hand was absent starts a fresh undo group.
-          if (!handPresentRef.current) { handPresentRef.current = true; lastHandKeyRef.current = null; pushUndo(); }
-          const tip = lms[8]; // index fingertip, normalized 0–1
-          const sx = (1 - tip.x) * vp.width; // mirror X to read like a mirror
-          const sy = tip.y * vp.height;
-          const world = screenToWorld(sx, sy);
-          const snap = getNearestSnap(world.x, world.y, CELL_SIZE, snapModeRef.current, canvasBoundsRef.current.w, canvasBoundsRef.current.h);
-          const spacing = snapSpacing(snapModeRef.current);
-          const within = !!snap && Math.hypot(world.x - snap.x, world.y - snap.y) <= spacing * GATE_FACTOR;
-          positionCursor(sx, sy, within, true);
-          if (within && snap) {
-            if (snap.key !== lastHandKeyRef.current) {
-              lastHandKeyRef.current = snap.key;
-              setDots((prev) => {
-                const next = new Map(prev);
-                const minDist = minSpacingRef.current * FINE_CELL;
-                if (next.has(snap.key) || farEnough(snap.x, snap.y, next, minDist)) {
-                  next.set(snap.key, { key: snap.key, x: snap.x, y: snap.y, color: colorRef.current, radius: radiusRef.current });
-                  if (mirrorXRef.current || mirrorYRef.current) {
-                    const { w, h } = canvasBoundsRef.current;
-                    for (const m of mirrorSnaps(snap.x, snap.y, w, h, snapModeRef.current, mirrorXRef.current, mirrorYRef.current)) {
-                      if (m.key !== snap.key && (next.has(m.key) || farEnough(m.x, m.y, next, minDist))) next.set(m.key, { key: m.key, x: m.x, y: m.y, color: colorRef.current, radius: radiusRef.current });
-                    }
-                  }
-                }
-                return next;
-              });
-            }
-          } else {
-            lastHandKeyRef.current = null; // re-arm so returning to a point places again
-          }
-        } else {
-          handPresentRef.current = false;
-          positionCursor(0, 0, false, false);
-        }
-      } else {
-        handPresentRef.current = false;
-        positionCursor(0, 0, false, false);
-      }
-      handLoopRef.current = requestAnimationFrame(tick);
-    };
-    stopHandLoop();
-    handLoopRef.current = requestAnimationFrame(tick);
-  }, [positionCursor, pushUndo, stopHandLoop]);
-
-  useEffect(() => {
-    if (!handMode) return;
-    let cancelled = false;
-    let stream: MediaStream | null = null;
-    setHandStatus("loading");
-    (async () => {
-      try {
-        const { vision, fileset } = await loadVision();
-        stream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 } });
-        const video = videoRef.current;
-        if (cancelled || !video) { stream?.getTracks().forEach((t) => t.stop()); return; }
-        video.srcObject = stream;
-        await video.play();
-        const landmarker = await vision.HandLandmarker.createFromOptions(fileset, {
-          baseOptions: { modelAssetPath: HAND_MODEL },
-          runningMode: "VIDEO",
-          numHands: 1,
-        });
-        if (cancelled) { landmarker.close?.(); stream.getTracks().forEach((t) => t.stop()); return; }
-        landmarkerRef.current = landmarker;
-        visionRef.current = vision;
-        connectionsRef.current = vision.HandLandmarker.HAND_CONNECTIONS;
-        setHandStatus("ready");
-        startHandLoop();
-      } catch {
-        if (!cancelled) setHandStatus("error");
-      }
-    })();
-    return () => {
-      cancelled = true;
-      stopHandLoop();
-      try { landmarkerRef.current?.close?.(); } catch { /* ignore */ }
-      landmarkerRef.current = null;
-      drawingUtilsRef.current = null;
-      if (stream) stream.getTracks().forEach((t) => t.stop());
-      setHandStatus("off");
-    };
-  }, [handMode, startHandLoop, stopHandLoop]);
-
-  // Drag the camera window by its header; resize from the bottom-right grip.
-  // Both write straight to the DOM during the gesture and commit to state on
-  // release, so the big component doesn't re-render every pointer move.
-  const startCamDrag = useCallback((e: React.PointerEvent) => {
-    e.preventDefault(); e.stopPropagation();
-    const el = camRef.current; if (!el) return;
-    const px = e.clientX, py = e.clientY, ox = el.offsetLeft, oy = el.offsetTop;
-    const move = (ev: PointerEvent) => {
-      el.style.left = `${ox + (ev.clientX - px)}px`;
-      el.style.top = `${oy + (ev.clientY - py)}px`;
-    };
-    const up = () => {
-      window.removeEventListener("pointermove", move);
-      window.removeEventListener("pointerup", up);
-      const vp = viewportRef.current;
-      const x = Math.min(Math.max(0, el.offsetLeft), Math.max(0, vp.width - 40));
-      const y = Math.min(Math.max(0, el.offsetTop), Math.max(0, vp.height - 40));
-      setCamPos({ x, y });
-    };
-    window.addEventListener("pointermove", move);
-    window.addEventListener("pointerup", up);
-  }, []);
-
-  const startCamResize = useCallback((e: React.PointerEvent) => {
-    e.preventDefault(); e.stopPropagation();
-    const el = camRef.current; if (!el) return;
-    const px = e.clientX, w0 = el.offsetWidth;
-    const move = (ev: PointerEvent) => {
-      const w = Math.max(120, Math.min(520, w0 + (ev.clientX - px)));
-      el.style.width = `${w}px`;
-      el.style.height = `${w * CAM_ASPECT}px`;
-    };
-    const up = () => {
-      window.removeEventListener("pointermove", move);
-      window.removeEventListener("pointerup", up);
-      setCamW(el.offsetWidth);
-    };
-    window.addEventListener("pointermove", move);
-    window.addEventListener("pointerup", up);
-  }, []);
-
-  const toggleHandMode = useCallback(() => {
-    setHandMode((m) => {
-      const next = !m;
-      // Drop the window into the top-right of the canvas the first time it opens.
-      if (next) setCamPos({ x: Math.max(12, viewportRef.current.width - camW - 12), y: compact ? 68 : 12 });
-      return next;
-    });
-    sfx.toggle();
-  }, [camW, compact]);
 
   const zoomTo = useCallback((newZoom: number) => {
     const cx = viewportSize.width / 2; const cy = viewportSize.height / 2;
@@ -2504,10 +2414,22 @@ export function DotArtTool({ showHome, onShowHome, onHideHome }: DotArtToolProps
   }, [layers, canvasPxW, canvasPxH, pxPerUnit, unit, canvasBg, gridColor, gridOpacity, gridThickness, dotShape]);
 
   const exportPNG = useCallback(() => {
+    // Browsers cap a single <canvas> dimension around ~16000px (Chrome; some
+    // are lower) — a large physical canvas at a fine cell size can exceed
+    // that at the usual 4x scale and silently produce a blank/truncated PNG.
+    // Step the scale down to whatever still fits; if even 1x doesn't fit,
+    // there's no usable raster size — bail out and point at SVG (vector,
+    // no size ceiling at all).
+    const MAX_RASTER_DIM = 16000;
+    const rawScale = Math.floor(MAX_RASTER_DIM / Math.max(canvasPxW, canvasPxH));
+    if (rawScale < 1) {
+      alert("This canvas is too large to export as PNG at any usable resolution — export SVG instead (vector, no size limit).");
+      return;
+    }
+    const scale = Math.min(4, rawScale);
     sfx.export();
     const allDots = flattenLayers(layers);
     const content = buildSVGString(allDots, canvasPxW, canvasPxH, pxPerUnit, unit, canvasBg, gridColor, gridOpacity, gridThickness, CELL_SIZE, dotShape);
-    const scale = 4;
     const outW = Math.max(1, Math.round(canvasPxW * scale));
     const outH = Math.max(1, Math.round(canvasPxH * scale));
     const captionH = Math.round(24 * scale); // reserved white strip below the artwork
@@ -2540,14 +2462,25 @@ export function DotArtTool({ showHome, onShowHome, onHideHome }: DotArtToolProps
   }, [layers, canvasPxW, canvasPxH, pxPerUnit, unit, canvasBg, gridColor, gridOpacity, gridThickness, dotShape]);
 
   const exportPDF = useCallback(() => {
-    sfx.export();
-    const allDots = flattenLayers(layers);
-    const svgContent = buildSVGString(allDots, canvasPxW, canvasPxH, pxPerUnit, unit, canvasBg, gridColor, gridOpacity, gridThickness, CELL_SIZE, dotShape);
-
     const widthMm = unit === "mm" ? canvasPhysW : convertUnit(canvasPhysW, unit, "mm");
     const heightMm = unit === "mm" ? canvasPhysH : convertUnit(canvasPhysH, unit, "mm");
 
-    const dpi = 300; // print quality
+    // Same raster-dimension ceiling as exportPNG — step dpi down from the
+    // usual 300 (print quality) if the physical size would exceed it, and
+    // bail below a "not worth it" floor (72dpi, screen resolution) rather
+    // than silently rendering a blank/truncated page.
+    const MAX_RASTER_DIM = 16000;
+    const longestMm = Math.max(widthMm, heightMm);
+    const rawDpi = Math.floor(MAX_RASTER_DIM / (longestMm / 25.4));
+    if (rawDpi < 72) {
+      alert("This canvas is too large to export as PDF at any usable resolution — export SVG instead (vector, no size limit).");
+      return;
+    }
+    const dpi = Math.min(300, rawDpi); // print quality, capped by the raster ceiling
+
+    sfx.export();
+    const allDots = flattenLayers(layers);
+    const svgContent = buildSVGString(allDots, canvasPxW, canvasPxH, pxPerUnit, unit, canvasBg, gridColor, gridOpacity, gridThickness, CELL_SIZE, dotShape);
 
     const renderW = Math.round(widthMm / 25.4 * dpi);
     const renderH = Math.round(heightMm / 25.4 * dpi);
@@ -2863,7 +2796,7 @@ export function DotArtTool({ showHome, onShowHome, onHideHome }: DotArtToolProps
 
   // Live preview dots — recomputed whenever the image or any control changes.
   // The final Min. Spacing pass reuses the same app-wide floor as every other
-  // placement path (draw, brush, line/pen/shape, array, hand-draw).
+  // placement path (draw, brush, line/pen/shape, array).
   const previewDots = useMemo(() => {
     if (!importImg) return null;
     const minDist = minSpacing * FINE_CELL;
@@ -3094,10 +3027,19 @@ export function DotArtTool({ showHome, onShowHome, onHideHome }: DotArtToolProps
     }
   }, [textDots, textDims, canvasBg, textOpen]);
 
-  // Autosave the document to localStorage (debounced) on any change.
+  // Autosave the document to localStorage (debounced) on any change. At very
+  // high dot counts the serialized scene can exceed localStorage's ~5-10MB
+  // quota — the write then throws and silently no-ops, which used to mean
+  // the crash-recovery safety net quietly stopped working with no
+  // indication. autosaveFailed surfaces that instead of swallowing it, and
+  // clears itself the moment a save succeeds again (e.g. after deleting
+  // enough dots to fit).
   useEffect(() => {
     const id = window.setTimeout(() => {
-      try { localStorage.setItem(AUTOSAVE_KEY, JSON.stringify(buildScene())); } catch { /* quota / private mode */ }
+      try {
+        localStorage.setItem(AUTOSAVE_KEY, JSON.stringify(buildScene()));
+        setAutosaveFailed(false);
+      } catch { setAutosaveFailed(true); }
     }, 400);
     return () => window.clearTimeout(id);
   }, [buildScene]);
@@ -3168,42 +3110,250 @@ export function DotArtTool({ showHome, onShowHome, onHideHome }: DotArtToolProps
   const isDragging = isDraggingDotsRef.current;
   const { dx: moveDx, dy: moveDy } = dragOffset;
 
-  // Grid lines are pure functions of the canvas size / grid style / zoom —
-  // memoized so pointermove-driven re-renders (hover, preview, drag) skip
-  // rebuilding ~350 <line> elements when none of that actually changed. Deps
-  // include both cols/rows AND canvasPxW/canvasPxH: cols/rows are Math.round()
-  // of the latter, so a canvas-size change that doesn't cross a rounding
-  // boundary could leave cols/rows unchanged while canvasPxW/H (the lines'
-  // actual x2/y2 bounds) did change — depending on only one pair would risk a
-  // stale-length grid.
-  const gridLines = useMemo(() => (
-    <>
-      {Array.from({ length: cols * GRID_SUBDIV - 1 }, (_, idx) => {
-        const i = idx + 1;
-        if (i % GRID_SUBDIV === 0) return null;
-        const isMid = i % GRID_SUBDIV === GRID_SUBDIV / 2;
-        const x = i * (CELL_SIZE / GRID_SUBDIV);
-        return <line key={`sv${i}`} x1={x} y1={0} x2={x} y2={canvasPxH}
-          stroke={gridColor} strokeOpacity={gridOpacity * (isMid ? 0.72 : 0.4)} strokeWidth={(gridThickness * (isMid ? 0.8 : 0.5)) / zoom} />;
-      })}
-      {Array.from({ length: rows * GRID_SUBDIV - 1 }, (_, idx) => {
-        const i = idx + 1;
-        if (i % GRID_SUBDIV === 0) return null;
-        const isMid = i % GRID_SUBDIV === GRID_SUBDIV / 2;
-        const y = i * (CELL_SIZE / GRID_SUBDIV);
-        return <line key={`sh${i}`} x1={0} y1={y} x2={canvasPxW} y2={y}
-          stroke={gridColor} strokeOpacity={gridOpacity * (isMid ? 0.72 : 0.4)} strokeWidth={(gridThickness * (isMid ? 0.8 : 0.5)) / zoom} />;
-      })}
-      {Array.from({ length: cols + 1 }, (_, i) => (
-        <line key={`v${i}`} x1={i * CELL_SIZE} y1={0} x2={i * CELL_SIZE} y2={canvasPxH}
-          stroke={gridColor} strokeOpacity={gridOpacity} strokeWidth={gridThickness / zoom} />
-      ))}
-      {Array.from({ length: rows + 1 }, (_, i) => (
-        <line key={`h${i}`} x1={0} y1={i * CELL_SIZE} x2={canvasPxW} y2={i * CELL_SIZE}
-          stroke={gridColor} strokeOpacity={gridOpacity} strokeWidth={gridThickness / zoom} />
-      ))}
-    </>
-  ), [cols, rows, canvasPxW, canvasPxH, gridColor, gridOpacity, gridThickness, zoom]);
+  // ── Canvas scene ─────────────────────────────────────────────────────
+  // Everything that used to be plain SVG shapes — viewport bg, drop shadow,
+  // canvas bg, the 3-tier grid, border, mirror axes, AND the dots
+  // themselves — now draws to a <canvas> sized/transformed to match the
+  // SVG's own pan/zoom/rot exactly. Grid math is the same loops
+  // `buildSVGString` (src/lib/scene.ts) uses to build the export string,
+  // with the same zoom-compensated line widths the old live SVG grid used
+  // (export has no "zoom", always 1x). Selection/hover rings, previews, the
+  // marquee, and the cursor-hit rect stay SVG on top — see the JSX below.
+  //
+  // The resolved `--viewport` CSS color is cached in a ref, refreshed only
+  // when `dark` changes, instead of a getComputedStyle() call inside this
+  // function — which reruns on every pan/zoom/rotate tick, a much hotter
+  // path than a theme toggle.
+  // useLayoutEffect (not useEffect) and defined BEFORE drawScene's own
+  // paint effect below — same-phase effects run in source order, so this is
+  // guaranteed to refresh the ref before the repaint effect reads it on the
+  // same theme-toggle commit. A plain useEffect here raced the paint: it
+  // runs after the browser has already painted, so the repaint below could
+  // fire first with the stale color and never get a second nudge to redraw.
+  const viewportBgRef = useRef("#ffffff");
+  useLayoutEffect(() => {
+    if (containerRef.current) {
+      viewportBgRef.current = getComputedStyle(containerRef.current).getPropertyValue("--viewport").trim() || "#ffffff";
+    }
+  }, [dark]);
+
+  // Layer-switch pulse alpha, driven by a rAF tween (see the effect below,
+  // keyed on layerPulseKey) — read here as a ref so ticking it doesn't need
+  // to be one of drawScene's dependencies; the tween calls drawScene()
+  // directly on every frame instead of going through the dep-triggered
+  // paint effect.
+  const activeAlphaRef = useRef(1);
+
+  const sceneCanvasRef = useRef<HTMLCanvasElement>(null);
+  const drawScene = useCallback(() => {
+    const canvas = sceneCanvasRef.current;
+    if (!canvas) return;
+    const dpr = window.devicePixelRatio || 1;
+    const w = viewportSize.width, h = viewportSize.height;
+    const pxW = Math.round(w * dpr), pxH = Math.round(h * dpr);
+    if (canvas.width !== pxW) canvas.width = pxW;
+    if (canvas.height !== pxH) canvas.height = pxH;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, w, h);
+    ctx.fillStyle = viewportBgRef.current;
+    ctx.fillRect(0, 0, w, h);
+
+    ctx.save();
+    ctx.translate(pan.x, pan.y);
+    ctx.rotate(rot);
+    ctx.scale(zoom, zoom);
+
+    // Drop shadow, then the canvas's own background.
+    ctx.fillStyle = "rgba(0,0,0,0.12)";
+    ctx.fillRect(6 / zoom, 8 / zoom, canvasPxW, canvasPxH);
+    ctx.fillStyle = canvasBg;
+    ctx.fillRect(0, 0, canvasPxW, canvasPxH);
+
+    // 3-tier grid: minor subdivisions, then bold main lines. Batched into 3
+    // stroke() calls (one per alpha/width group) instead of one beginPath/
+    // stroke per line — on a canvas large enough for a few hundred thousand
+    // dots that was several thousand individual stroke() calls (plus a
+    // globalAlpha/lineWidth reassignment on nearly every one) every single
+    // redraw, i.e. every pan tick and zoom step. Same geometry, same alpha,
+    // same widths — just fewer draw calls, so the grid renders identically.
+    const sub = CELL_SIZE / GRID_SUBDIV;
+    const mid = GRID_SUBDIV / 2;
+    ctx.strokeStyle = gridColor;
+
+    ctx.globalAlpha = gridOpacity * 0.4;
+    ctx.lineWidth = (gridThickness * 0.5) / zoom;
+    ctx.beginPath();
+    for (let i = 1; i < cols * GRID_SUBDIV; i++) {
+      if (i % GRID_SUBDIV === 0 || i % GRID_SUBDIV === mid) continue;
+      const x = i * sub;
+      ctx.moveTo(x, 0); ctx.lineTo(x, canvasPxH);
+    }
+    for (let i = 1; i < rows * GRID_SUBDIV; i++) {
+      if (i % GRID_SUBDIV === 0 || i % GRID_SUBDIV === mid) continue;
+      const y = i * sub;
+      ctx.moveTo(0, y); ctx.lineTo(canvasPxW, y);
+    }
+    ctx.stroke();
+
+    ctx.globalAlpha = gridOpacity * 0.72;
+    ctx.lineWidth = (gridThickness * 0.8) / zoom;
+    ctx.beginPath();
+    for (let i = mid; i < cols * GRID_SUBDIV; i += GRID_SUBDIV) {
+      const x = i * sub;
+      ctx.moveTo(x, 0); ctx.lineTo(x, canvasPxH);
+    }
+    for (let i = mid; i < rows * GRID_SUBDIV; i += GRID_SUBDIV) {
+      const y = i * sub;
+      ctx.moveTo(0, y); ctx.lineTo(canvasPxW, y);
+    }
+    ctx.stroke();
+
+    ctx.globalAlpha = gridOpacity;
+    ctx.lineWidth = gridThickness / zoom;
+    ctx.beginPath();
+    for (let i = 0; i <= cols; i++) {
+      const x = i * CELL_SIZE;
+      ctx.moveTo(x, 0); ctx.lineTo(x, canvasPxH);
+    }
+    for (let i = 0; i <= rows; i++) {
+      const y = i * CELL_SIZE;
+      ctx.moveTo(0, y); ctx.lineTo(canvasPxW, y);
+    }
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+
+    // Border.
+    ctx.strokeStyle = "#999";
+    ctx.lineWidth = 1 / zoom;
+    ctx.strokeRect(0, 0, canvasPxW, canvasPxH);
+
+    // Mirror axes — same bg-lightness-picked color as `selectionRingColor`
+    // below (inlined here rather than depended-on, since that `const` is
+    // computed further down in source order and a dependency array can't
+    // reference it before it's initialized — see the state-vs-ref mirroring
+    // gotcha in this file's module comment / CLAUDE.md).
+    if (mirrorX || mirrorY) {
+      const bgHex = canvasBg.replace("#", "");
+      const bgIsLightHere = bgHex.length < 6 ? true : (() => {
+        const r = parseInt(bgHex.slice(0, 2), 16), g = parseInt(bgHex.slice(2, 4), 16), b = parseInt(bgHex.slice(4, 6), 16);
+        return 0.299 * r + 0.587 * g + 0.114 * b > 140;
+      })();
+      ctx.strokeStyle = bgIsLightHere ? "#4361EE" : "#FFD700";
+      ctx.globalAlpha = 0.6;
+      ctx.lineWidth = 1 / zoom;
+      ctx.setLineDash([7 / zoom, 5 / zoom]);
+      if (mirrorX) { ctx.beginPath(); ctx.moveTo(canvasPxW / 2, 0); ctx.lineTo(canvasPxW / 2, canvasPxH); ctx.stroke(); }
+      if (mirrorY) { ctx.beginPath(); ctx.moveTo(0, canvasPxH / 2); ctx.lineTo(canvasPxW, canvasPxH / 2); ctx.stroke(); }
+      ctx.setLineDash([]);
+      ctx.globalAlpha = 1;
+    }
+
+    // Dots — every visible layer, bottom→top (array order = stack order).
+    // Viewport culling: map the 4 viewport corners into world space via the
+    // same screenToWorld used for pointer input, take their axis-aligned
+    // bounding box (a rotated viewport's true footprint isn't
+    // axis-aligned, but the AABB of its corners is guaranteed to contain it
+    // — just not maximally tight, which is fine), and skip any dot outside
+    // it. Cheap, correctness-neutral, and the difference between redrawing
+    // everything vs. only what's on-screen once zoomed into a large canvas.
+    const corners = [
+      screenToWorld(0, 0), screenToWorld(viewportSize.width, 0),
+      screenToWorld(0, viewportSize.height), screenToWorld(viewportSize.width, viewportSize.height),
+    ];
+    const cullPad = 50; // generous margin for dot radius + antialiasing
+    const cullMinX = Math.min(...corners.map((c) => c.x)) - cullPad;
+    const cullMaxX = Math.max(...corners.map((c) => c.x)) + cullPad;
+    const cullMinY = Math.min(...corners.map((c) => c.y)) - cullPad;
+    const cullMaxY = Math.max(...corners.map((c) => c.y)) + cullPad;
+
+    // Tried color-batching here (group by color/alpha into fewer fill()
+    // calls) and measured it — reverted. It regressed the common case: for
+    // photographic imports (near-continuous per-pixel colors, little to
+    // consolidate), the grouping bookkeeping itself (a Map lookup + object
+    // allocation per dot, paid on EVERY redraw including pan/zoom which
+    // touch no new data) cost more than the fill()-call savings ever
+    // recovered — measured single-dot-placement redraw at 40k dots going
+    // from ~45ms to ~200-400ms. Only a flat-color/few-palette-colors layer
+    // would've actually benefited, and that case was already fast. Left as
+    // the simple per-dot loop.
+    for (const layer of layers) {
+      if (!layer.visible) continue;
+      const isActiveLayer = layer.id === activeLayerId;
+      // Layer-switch pulse: only the active layer's dots fade with the tween
+      // (activeAlphaRef is 1 outside of one, so this is a no-op then).
+      const layerAlpha = isActiveLayer ? activeAlphaRef.current : 1;
+      for (const d of layer.dots.values()) {
+        // Drag ghost: a selected dot on the active layer, mid-drag, draws
+        // OFFSET by the live drag delta at reduced alpha — same rule
+        // DotLayerImpl used to apply per-dot before dots moved to canvas.
+        const isDraggingThis = isActiveLayer && isDragging && selectedKeysRef.current.has(d.key);
+        const x = isDraggingThis ? d.x + moveDx : d.x;
+        const y = isDraggingThis ? d.y + moveDy : d.y;
+        if (x < cullMinX || x > cullMaxX || y < cullMinY || y > cullMaxY) continue;
+        ctx.globalAlpha = (isDraggingThis ? 0.7 : 1) * layerAlpha;
+        ctx.fillStyle = d.color;
+        if (dotShape === "bar") {
+          const b = barRect(x, y, d.radius);
+          if (ctx.roundRect) { ctx.beginPath(); ctx.roundRect(b.x, b.y, b.w, b.h, b.rx); ctx.fill(); }
+          else ctx.fillRect(b.x, b.y, b.w, b.h); // fallback for older engines: square corners
+        } else {
+          ctx.beginPath();
+          ctx.arc(x, y, d.radius, 0, Math.PI * 2);
+          ctx.fill();
+        }
+      }
+    }
+    ctx.globalAlpha = 1;
+
+    ctx.restore();
+    // `dark` isn't read directly in this function (viewportBgRef.current is,
+    // which the sibling effect above refreshes on the same dependency) — it's
+    // listed here purely so this callback's identity changes on a theme
+    // toggle too, which is what actually re-triggers the paint effect below.
+    // Without it, the ref value updates but nothing repaints until some
+    // unrelated dep (pan/zoom/etc.) happens to change next.
+    //
+    // selectedKeys is deliberately NOT a dep: selection has no visual effect
+    // on this canvas except the drag-ghost offset above, which reads
+    // selectedKeysRef instead (kept in perfect sync — every setSelectedKeys
+    // call site updates the ref in the same breath). Selection changes fire
+    // on every marquee-drag pointermove; without this, each of those forced
+    // a full repaint of a byte-identical canvas.
+  }, [viewportSize, pan, zoom, rot, canvasPxW, canvasPxH, canvasBg, gridColor, gridOpacity, gridThickness, cols, rows, mirrorX, mirrorY, dark, layers, dotShape, activeLayerId, isDragging, moveDx, moveDy]);
+
+  useLayoutEffect(() => { drawScene(); }, [drawScene]);
+
+  // Layer-switch pulse — replaces the old `.dotart-layer-pulse` CSS
+  // animation (theme.css), which animated a per-layer SVG <g> that no
+  // longer exists now that dots are canvas pixels. Same shape (0% -> 1,
+  // 50% -> 0.55, 100% -> 1, 250ms, ease-in-out) and reduced-motion guard as
+  // the original keyframes, just driven by a rAF tween writing
+  // activeAlphaRef and imperatively repainting each frame, since a ref
+  // change alone doesn't retrigger drawScene's dependency-driven effect.
+  // Skips on mount (layerPulseKey starts at 0 and this only bumps on an
+  // explicit layer-nav switch).
+  useEffect(() => {
+    if (layerPulseKey === 0) return;
+    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+    const DURATION = 250;
+    const start = performance.now();
+    let raf = 0;
+    const easeInOutQuad = (t: number) => (t < 0.5 ? 2 * t * t : 1 - ((-2 * t + 2) ** 2) / 2);
+    const tick = (now: number) => {
+      const t = Math.min(1, (now - start) / DURATION);
+      const half = t < 0.5 ? t / 0.5 : (t - 0.5) / 0.5;
+      const eased = easeInOutQuad(half);
+      activeAlphaRef.current = t < 0.5 ? 1 - 0.45 * eased : 0.55 + 0.45 * eased;
+      drawScene();
+      if (t < 1) raf = requestAnimationFrame(tick);
+      else activeAlphaRef.current = 1;
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [layerPulseKey, drawScene]);
 
   // Layer-nav arrows: index 0 = bottom of stack (matches moveLayer/render
   // order), so "layer above" = next index up.
@@ -3229,9 +3379,16 @@ export function DotArtTool({ showHome, onShowHome, onHideHome }: DotArtToolProps
   })();
   const selectionRingColor = bgIsLight ? "#4361EE" : "#FFD700";
 
-  const selectedDots = Array.from(selectedKeys).map((k) => dots.get(k)).filter(Boolean) as Dot[];
-  const selColors = [...new Set(selectedDots.map((d) => d.color))];
-  const selRadii = [...new Set(selectedDots.map((d) => d.radius))];
+  // Memoized: this used to recompute on every render (hover, pan, zoom, drag
+  // — none of which change the selection) — O(selection size) on each, real
+  // cost with a large selection (e.g. after Ctrl+A) sitting on screen.
+  const { selColors, selRadii } = useMemo(() => {
+    const selectedDots = Array.from(selectedKeys).map((k) => dots.get(k)).filter(Boolean) as Dot[];
+    return {
+      selColors: [...new Set(selectedDots.map((d) => d.color))],
+      selRadii: [...new Set(selectedDots.map((d) => d.radius))],
+    };
+  }, [selectedKeys, dots]);
   const selColor = selColors.length === 1 ? selColors[0] : color;
   const selRadius = selRadii.length === 1 ? selRadii[0] : radius;
   const selMixed = selColors.length > 1 || selRadii.length > 1;
@@ -3279,6 +3436,40 @@ export function DotArtTool({ showHome, onShowHome, onHideHome }: DotArtToolProps
     });
   };
   const onPickerChange = (c: string) => { lastPickRef.current = c; editingSelection ? recolorSelectionLive(c) : setColor(c); };
+
+  // Dev-only test-observability hook (never present in a production build —
+  // `import.meta.env.DEV` is statically false there, so this whole block is
+  // dead-code-eliminated). Exists so tests can read dot state directly
+  // instead of counting SVG <circle> DOM nodes — a dependency the planned
+  // Canvas2D render-layer rewrite would otherwise break, since dots stop
+  // being DOM nodes at all. Set up once; every function reads live refs
+  // (never closed-over state) so it can't go stale as the app runs.
+  useEffect(() => {
+    if (!import.meta.env.DEV) return;
+    (window as any).__tangaliyaTest = {
+      dots: () => flattenLayers(layersRef.current).map((d) => ({ key: d.key, x: d.x, y: d.y, color: d.color, radius: d.radius })),
+      count: () => flattenLayers(layersRef.current).length,
+      // Client (viewport) x/y for the i-th visible dot — the forward
+      // transform world -> screen, i.e. the algebraic inverse of
+      // screenToWorld above: screen = pan + zoom * R(rot) * world.
+      dotScreenPos: (i: number) => {
+        const d = flattenLayers(layersRef.current)[i];
+        if (!d || !svgRef.current) return null;
+        const rect = svgRef.current.getBoundingClientRect();
+        const c = Math.cos(rotRef.current), s = Math.sin(rotRef.current);
+        const dx = d.x * c - d.y * s, dy = d.x * s + d.y * c;
+        return {
+          x: rect.left + panRef.current.x + dx * zoomRef.current,
+          y: rect.top + panRef.current.y + dy * zoomRef.current,
+        };
+      },
+      // World-space canvas size (w/h in px) — lets tests check dot bounds
+      // without depending on the background rect's DOM structure, which the
+      // planned Canvas2D substrate rewrite will move off the SVG entirely.
+      canvasBounds: () => ({ w: canvasBoundsRef.current.w, h: canvasBoundsRef.current.h }),
+    };
+    return () => { delete (window as any).__tangaliyaTest; };
+  }, []);
 
   // A preview/ghost dot in the current dot shape, so hovering and stroke
   // previews match what will actually be placed.
@@ -3456,7 +3647,7 @@ export function DotArtTool({ showHome, onShowHome, onHideHome }: DotArtToolProps
             onChange={setActiveRadius} />
 
           {/* Min. Spacing — absolute floor, in subgrid units, applied across
-              every placement tool (draw, brush, line, pen, shape, hand-draw) */}
+              every placement tool (draw, brush, line, pen, shape) */}
           <ValueSlider label="Min. Spacing" min={1} max={20}
             value={minSpacing}
             display={`${minSpacing} step${minSpacing === 1 ? "" : "s"}`}
@@ -3504,55 +3695,17 @@ export function DotArtTool({ showHome, onShowHome, onHideHome }: DotArtToolProps
         onPointerUp={handlePointerUp} onPointerLeave={handlePointerLeave}
         onPointerCancel={handlePointerCancel}
         onDoubleClick={handleDoubleClick}>
+        {/* Canvas substrate — viewport bg, shadow, canvas bg, grid, border,
+            mirror axes, and the dots. See `drawScene` above. Sits BEHIND the svg via
+            DOM order (both position:absolute inset-0, no z-index). */}
+        <canvas ref={sceneCanvasRef} className="absolute inset-0" style={{ width: viewportSize.width, height: viewportSize.height }} />
         <svg ref={svgRef} width={viewportSize.width} height={viewportSize.height}
           className="absolute inset-0 select-none" style={{ touchAction: "none" }}>
 
-          <rect width={viewportSize.width} height={viewportSize.height} style={{ fill: "var(--viewport)" }} />
-
           <g transform={`translate(${pan.x},${pan.y}) scale(${zoom}) rotate(${(rot * 180) / Math.PI})`}>
-            <rect x={6 / zoom} y={8 / zoom} width={canvasPxW} height={canvasPxH} fill="#000" opacity={0.12} />
-            <rect x={0} y={0} width={canvasPxW} height={canvasPxH} fill={canvasBg} />
-
-            {/* Minor + main grid lines — memoized, see `gridLines` above */}
-            {gridLines}
-
-            <rect x={0} y={0} width={canvasPxW} height={canvasPxH} fill="none"
-              stroke="#999" strokeWidth={1 / zoom} />
-
-            {/* Mirror axes: the center line(s) dots reflect across while a
-                mirror toggle is on — a visual reference only (never exported,
-                never a dot). Left-right mirror = vertical center line;
-                top-bottom mirror = horizontal center line. */}
-            {mirrorX && (
-              <line x1={canvasPxW / 2} y1={0} x2={canvasPxW / 2} y2={canvasPxH}
-                stroke={selectionRingColor} strokeOpacity={0.6} strokeWidth={1 / zoom}
-                strokeDasharray={`${7 / zoom},${5 / zoom}`} style={{ pointerEvents: "none" }} />
-            )}
-            {mirrorY && (
-              <line x1={0} y1={canvasPxH / 2} x2={canvasPxW} y2={canvasPxH / 2}
-                stroke={selectionRingColor} strokeOpacity={0.6} strokeWidth={1 / zoom}
-                strokeDasharray={`${7 / zoom},${5 / zoom}`} style={{ pointerEvents: "none" }} />
-            )}
-
-            {/* Composite every visible layer bottom→top; selection/hover rings
-                and drag-offset only apply to the active layer being edited.
-                Inactive layers get CONSTANT props (null/false/0) so hover,
-                selection, and drag churn on the active layer never re-renders
-                them — see DotLayer's module-scope definition above. */}
-            {layers.map((layer) => layer.visible && (
-              <DotLayer key={layer.id}
-                layer={layer}
-                isActive={layer.id === activeLayerId}
-                dotShape={dotShape}
-                zoom={zoom}
-                selectedKeys={layer.id === activeLayerId ? selectedKeys : null}
-                isDragging={layer.id === activeLayerId ? isDragging : false}
-                moveDx={layer.id === activeLayerId ? moveDx : 0}
-                moveDy={layer.id === activeLayerId ? moveDy : 0}
-                pulseKey={layer.id === activeLayerId ? layerPulseKey : undefined}
-              />
-            ))}
-
+            {/* Dots themselves render to the <canvas> underneath now (see
+                drawScene above) — composited bottom→top across every visible
+                layer there. Selection/hover rings stay SVG, here. */}
             {(selectedKeys.size > 0 || hoveredDotKey) && (
               <SelectionOverlay
                 dots={dots}
@@ -3827,6 +3980,18 @@ export function DotArtTool({ showHome, onShowHome, onHideHome }: DotArtToolProps
         {/* Stats + Layers panel (floating, top-right) — same pill height as
             the Tools cluster and the Undo/Redo cluster for visual consistency. */}
         <div className="absolute top-4 right-4 z-20 flex items-start gap-2">
+          {/* Autosave-quota warning — the debounced localStorage backup
+              (separate from Save Project) silently stops working past
+              ~5-10MB of serialized dots; this makes that visible instead of
+              a quietly-broken crash-recovery net. Clears itself once a save
+              succeeds again. */}
+          {autosaveFailed && (
+            <div title="The document is too large for the browser's autosave backup. Your crash-recovery safety net is off — use Save Project to keep your work."
+              className="h-[43px] px-[14px] flex items-center gap-[7px] rounded-xl text-[12px] backdrop-blur-sm border border-amber-500/40 shadow-sm bg-amber-500/15 text-amber-600 dark:text-amber-400">
+              <TriangleAlert size={14} />
+              <span>Autosave off — save manually</span>
+            </div>
+          )}
           {/* Dot count + physical canvas size — replaces both the left
               panel's old status footer and the bottom-left status pill
               (removed). Size is shown once (WxH unit), not as both grid
@@ -4059,34 +4224,6 @@ export function DotArtTool({ showHome, onShowHome, onHideHome }: DotArtToolProps
           </>
         )}
 
-        {/* Hand-draw overlay: fingertip cursor + mirrored webcam preview */}
-        {handMode && (
-          <>
-            <div ref={cursorRef}
-              className="absolute top-0 left-0 z-20 rounded-full border-[2.5px] pointer-events-none shadow-[0_0_0_1px_rgba(0,0,0,0.35)]"
-              style={{ width: 26, height: 26, opacity: 0, transition: "opacity 140ms ease, transform 60ms linear" }} />
-            <div ref={camRef}
-              className="absolute z-20 rounded-xl overflow-hidden border border-[var(--overlay-border)] shadow-lg bg-black/50 backdrop-blur-sm select-none"
-              style={{ left: camPos.x, top: camPos.y, width: camW, height: camW * CAM_ASPECT }}>
-              <video ref={videoRef} autoPlay muted playsInline
-                className="block w-full h-full object-cover" style={{ transform: "scaleX(-1)" }} />
-              <canvas ref={overlayRef} width={320} height={240}
-                className="absolute inset-0 w-full h-full pointer-events-none" style={{ transform: "scaleX(-1)" }} />
-              {/* drag header */}
-              <div onPointerDown={startCamDrag}
-                className="absolute top-0 inset-x-0 h-6 flex items-center justify-between px-2 cursor-move bg-gradient-to-b from-black/60 to-transparent">
-                <span className="text-[10px] font-mono text-white/90 pointer-events-none">
-                  {handStatus === "ready" ? "● tracking" : handStatus === "loading" ? "starting…" : handStatus === "error" ? "no camera" : ""}
-                </span>
-                <GripHorizontal size={13} className="text-white/70 pointer-events-none" />
-              </div>
-              {/* resize grip */}
-              <div onPointerDown={startCamResize} title="Drag to resize"
-                className="absolute bottom-0 right-0 w-4 h-4 cursor-nwse-resize"
-                style={{ background: "linear-gradient(135deg, transparent 50%, rgba(255,255,255,0.7) 50%)" }} />
-            </div>
-          </>
-        )}
       </div>
 
       {/* ── Right panel — context inspector for the selected element ── */}
@@ -4568,7 +4705,7 @@ export function DotArtTool({ showHome, onShowHome, onHideHome }: DotArtToolProps
         <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/50 p-4"
           onClick={closeImport}>
           <div onClick={(e) => e.stopPropagation()}
-            className="dotart bg-[var(--card)] text-[var(--txt-1)] rounded-3xl p-5 w-[94vw] h-[94vh] max-w-[2000px] max-h-[97vh] flex flex-col gap-4 shadow-2xl">
+            className={`dotart${dark ? " dark" : ""} bg-[var(--card)] text-[var(--txt-1)] rounded-3xl p-5 w-[94vw] h-[94vh] max-w-[2000px] max-h-[97vh] flex flex-col gap-4 shadow-2xl`}>
             <div className="flex items-center justify-between shrink-0">
               <h2 className="text-[16px] font-medium flex items-center gap-2"><ImagePlus size={16} /> Import Image</h2>
               <button onClick={closeImport}
@@ -4764,7 +4901,7 @@ export function DotArtTool({ showHome, onShowHome, onHideHome }: DotArtToolProps
         <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/50 p-4"
           onClick={closeText}>
           <div onClick={(e) => e.stopPropagation()}
-            className="dotart bg-[var(--card)] text-[var(--txt-1)] rounded-3xl p-5 w-full max-w-[760px] max-h-[90vh] overflow-auto flex flex-col gap-4 shadow-2xl">
+            className={`dotart${dark ? " dark" : ""} bg-[var(--card)] text-[var(--txt-1)] rounded-3xl p-5 w-full max-w-[760px] max-h-[90vh] overflow-auto flex flex-col gap-4 shadow-2xl`}>
             <div className="flex items-center justify-between">
               <h2 className="text-[16px] font-medium flex items-center gap-2"><Type size={16} /> Text → Dots</h2>
               <button onClick={closeText}
@@ -4888,7 +5025,6 @@ export function DotArtTool({ showHome, onShowHome, onHideHome }: DotArtToolProps
           onDeleteActive={notifyProjectDeleted}
           onOpenImageTool={() => window.open(`${import.meta.env.BASE_URL}image.html`, "_blank")}
           onOpenTextTool={() => window.open(`${import.meta.env.BASE_URL}text.html`, "_blank")}
-          onEnableHandDraw={() => { if (!handMode) toggleHandMode(); onHideHome(); }}
           refreshSignal={homeRefresh}
           onClose={onHideHome}
         />

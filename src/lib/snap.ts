@@ -14,24 +14,12 @@ export function snapSpacing(mode: SnapMode): number {
   return mode === "fine" ? FINE_CELL : mode === "both" ? HALF_CELL : CELL_SIZE;
 }
 
-// Absolute minimum-distance gate: true if (x,y) is at least minDistPx away
-// from every dot already in `dots`. Used to enforce the global "Min. Spacing"
-// setting across every placement path (draw, brush walk, line/pen/shape,
-// hand-draw) regardless of which snap mode or spacing model produced the
-// candidate point.
-export function farEnough(x: number, y: number, dots: Map<string, { x: number; y: number }>, minDistPx: number): boolean {
-  if (minDistPx <= 0) return true;
-  for (const d of dots.values()) {
-    if (Math.hypot(d.x - x, d.y - y) < minDistPx) return false;
-  }
-  return true;
-}
-
-// Same greedy "first dot wins" rule as farEnough (raster scan order, since
-// Map iteration = insertion order = the grid's own scan order), but bucketed
-// into a spatial hash instead of a brute O(n²) scan — a bulk image import at
-// fine detail can produce 10^5-10^6 candidate dots, where farEnough's linear
-// scan per candidate would be far too slow for a live-scrubbed preview.
+// Same greedy "first dot wins" rule every min-spacing gate in this app uses
+// (raster scan order, since Map iteration = insertion order = the grid's own
+// scan order), but bucketed into a spatial hash instead of a brute O(n²)
+// scan — a bulk image import at fine detail can produce 10^5-10^6 candidate
+// dots, where a linear scan per candidate would be far too slow for a
+// live-scrubbed preview.
 export function filterMinSpacing<T extends { x: number; y: number }>(dots: Map<string, T>, minDistPx: number): Map<string, T> {
   if (minDistPx <= 0) return dots;
   const cell = minDistPx;
@@ -54,6 +42,83 @@ export function filterMinSpacing<T extends { x: number; y: number }>(dots: Map<s
     if (bucket) bucket.push(dot); else buckets.set(bk, [dot]);
   }
   return out;
+}
+
+// Generic uniform-grid spatial hash — same bucketing idea as filterMinSpacing
+// above, factored out for reuse by hit-testing (findDotAt/dotsInRect) and
+// per-stroke min-spacing gating. Bucket size is fixed at construction; nearby()
+// still finds every candidate within `radius` even if radius exceeds cellSize
+// (it widens the search ring instead of assuming a fixed 3x3), so a caller
+// that under-sizes the hash stays correct, just less optimal. Both nearby()
+// and inRect() return an over-inclusive candidate set — callers must still
+// exact-filter (distance check / bbox check) since bucket membership is
+// necessary but not sufficient.
+export class SpatialHash<T extends { x: number; y: number }> {
+  private buckets = new Map<string, T[]>();
+  constructor(private cellSize: number) {}
+
+  clear() { this.buckets.clear(); }
+
+  build(items: Iterable<T>) {
+    this.clear();
+    for (const item of items) this.insert(item);
+  }
+
+  insert(item: T) {
+    const key = this.bucketKey(item.x, item.y);
+    const bucket = this.buckets.get(key);
+    if (bucket) bucket.push(item); else this.buckets.set(key, [item]);
+  }
+
+  // Reference-identity removal — the caller must pass the exact item instance
+  // that was inserted (never a copy), which every current caller does.
+  remove(item: T) {
+    const bucket = this.buckets.get(this.bucketKey(item.x, item.y));
+    if (!bucket) return;
+    const idx = bucket.indexOf(item);
+    if (idx !== -1) bucket.splice(idx, 1);
+  }
+
+  private bucketKey(x: number, y: number): string {
+    return `${Math.floor(x / this.cellSize)},${Math.floor(y / this.cellSize)}`;
+  }
+
+  nearby(x: number, y: number, radius: number): T[] {
+    const reach = Math.max(1, Math.ceil(radius / this.cellSize));
+    const bx = Math.floor(x / this.cellSize), by = Math.floor(y / this.cellSize);
+    const out: T[] = [];
+    for (let dx = -reach; dx <= reach; dx++)
+      for (let dy = -reach; dy <= reach; dy++) {
+        const bucket = this.buckets.get(`${bx + dx},${by + dy}`);
+        if (bucket) out.push(...bucket);
+      }
+    return out;
+  }
+
+  inRect(minX: number, minY: number, maxX: number, maxY: number): T[] {
+    const bx0 = Math.floor(minX / this.cellSize), bx1 = Math.floor(maxX / this.cellSize);
+    const by0 = Math.floor(minY / this.cellSize), by1 = Math.floor(maxY / this.cellSize);
+    const out: T[] = [];
+    for (let bx = bx0; bx <= bx1; bx++)
+      for (let by = by0; by <= by1; by++) {
+        const bucket = this.buckets.get(`${bx},${by}`);
+        if (bucket) out.push(...bucket);
+      }
+    return out;
+  }
+}
+
+// Same exact rule as farEnough above — true if no item in `hash`'s
+// neighborhood of (x,y) is closer than minDist — but querying a SpatialHash's
+// narrow candidate set instead of every dot in the document. Generic over any
+// {x,y} item so both the draw-tool hot path and array.ts's placement pipeline
+// (which places {x,y} candidates before they're full Dots) can share it.
+export function farEnoughFast<T extends { x: number; y: number }>(hash: SpatialHash<T>, x: number, y: number, minDist: number): boolean {
+  if (minDist <= 0) return true;
+  for (const d of hash.nearby(x, y, minDist)) {
+    if (Math.hypot(d.x - x, d.y - y) < minDist) return false;
+  }
+  return true;
 }
 
 // Canvas-bounds gate (edges inclusive — x = 0 and x = canvasW are real snap
@@ -155,4 +220,16 @@ export function keyFromPosition(x: number, y: number, spacing: number = HALF_CEL
   const snappedX = col * spacing, snappedY = row * spacing;
   const key = spacing === FINE_CELL ? getFineKey(col, row) : getKey(Math.round(snappedX / HALF_CELL), Math.round(snappedY / HALF_CELL));
   return { key, x: snappedX, y: snappedY };
+}
+
+// A dot's own re-key granularity, independent of whatever snapMode the tool
+// is currently set to. Fine-lattice dots (key "f:col,row", e.g. from a
+// Sub-grid image import) live 2px apart; every other dot lives on the
+// half-cell (10px) lattice. Move/paste/nudge paths that re-key a dot after a
+// translation must use THIS, not snapSpacing(currentMode) — a fine dot
+// dragged while the tool is in "corner"/"center"/"both" mode would otherwise
+// get rounded from its 2px lattice onto the coarser 10/20px one, colliding
+// with (and silently erasing) any other fine dot in the same coarse bucket.
+export function nativeSpacing(key: string): number {
+  return key.startsWith("f:") ? FINE_CELL : HALF_CELL;
 }

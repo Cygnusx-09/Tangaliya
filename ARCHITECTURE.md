@@ -99,6 +99,15 @@ layer's dot wins on a shared snap point, since layers can overlap (the
 prefers `scene.layers` when present, and otherwise migrates an older
 flat-`dots` file into a single `"Layer 1"`.
 
+**Merge.** The Layers panel supports picking multiple layers (a checkbox
+per row, independent of which layer is "active") and merging them via
+`mergeLayers(ids)` in `useLayers.ts`. It combines the picked layers'
+dot Maps bottom-to-top — a higher layer's dot wins on a shared key,
+matching what's visually on top — into one new layer that lands in the
+stack slot of the lowest picked layer and takes the topmost picked
+layer's name. Like every other structure edit (add/delete/reorder), it's
+immediate and not on the undo stack.
+
 ## Export and the project file
 
 `buildSVGString` (`src/lib/scene.ts`) is the **single source of truth** for
@@ -246,7 +255,7 @@ scan — deliberately not spatially indexed, since dot counts have stayed
 small enough that it hasn't needed to be — that returns false if any
 existing dot in a map is closer than `minDistPx`. Every placement path in
 the app (the Draw tool's click and brush walk, and Line/Pen/Shape's shared
-`commitLineDots`, and hand-draw) gates each new dot through
+`commitLineDots`) gates each new dot through
 `next.has(key) || farEnough(...)` before writing it, checked against the
 *active layer only* — layers can already overlap by design, so a
 cross-layer floor would fight that. The `next.has(key)` half of the check
@@ -273,7 +282,7 @@ because nothing else places dots in bulk at this scale.
 A second app-wide gate lives alongside it: **canvas bounds** (edges
 inclusive — x = 0 and x = canvasW are real snap points). Most paths were
 always bounded because they snap through `getNearestSnap`, which returns
-null outside the canvas (draw clicks, hand-draw, Line/Pen/Shape outline
+null outside the canvas (draw clicks, Line/Pen/Shape outline
 via `computePathDots`), the brush walk breaks at the edge, and shape fill
 filters its scan. But four paths place or move dots through the unbounded
 `keyFromPosition` and used to leak: the Array pipeline

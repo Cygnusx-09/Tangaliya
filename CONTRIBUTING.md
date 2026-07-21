@@ -12,9 +12,7 @@ npm run dev
 ```
 
 Open the dev server URL. There's no `.env`, no external services required
-— everything runs locally except the hand-draw mode's MediaPipe model,
-which loads from a CDN at runtime and needs a secure context
-(`localhost` counts).
+— everything runs locally.
 
 ## Before you open a PR
 
